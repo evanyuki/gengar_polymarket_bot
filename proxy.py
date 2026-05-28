@@ -3,7 +3,7 @@ Proxy setup — routes all requests traffic through a SOCKS5 proxy (e.g. Tor).
 
 Call `apply_proxy()` once at startup, before any HTTP calls are made.
 This patches the default requests session so that ALL libraries using
-requests (including py_clob_client) automatically go through the proxy.
+requests (including py_clob_client_v2) automatically go through the proxy.
 
 For Tor, call `ensure_tor()` to auto-generate a torrc that pins exit nodes
 to Polymarket-friendly countries and (re)start Tor with it.
@@ -196,7 +196,8 @@ def ensure_tor(exit_countries: Optional[list[str]] = None) -> str:
     tor_bin = shutil.which("tor")
     if not tor_bin:
         raise RuntimeError(
-            "Tor is not installed. Install with: brew install tor"
+            "Tor is not installed. Install on Linux with: sudo apt-get update && sudo apt-get install -y tor; "
+            "on macOS with: brew install tor"
         )
 
     torrc = _write_torrc(exit_countries)
@@ -242,7 +243,7 @@ def apply_proxy(proxy_url: str) -> None:
     Polymarket's geoblocking only applies to the CLOB API (clob.polymarket.com).
     The Gamma API (gamma-api.polymarket.com) is read-only and does not geoblock.
     Routing Gamma through Tor adds ~5-10s latency per page of market results,
-    which makes scans painfully slow. So we only proxy httpx (py_clob_client).
+    which makes scans painfully slow. So we only proxy httpx (py_clob_client_v2).
 
     Args:
         proxy_url: e.g. "socks5h://127.0.0.1:9050" for Tor.
@@ -255,7 +256,7 @@ def apply_proxy(proxy_url: str) -> None:
         return
 
     # ── 1. httpx monkey-patch (CLOB / trading) ────────────────
-    # py_clob_client constructs httpx.Client() internally. Patching __init__
+    # py_clob_client_v2 constructs httpx.Client() internally. Patching __init__
     # ensures every Client gets the proxy even if it was already imported.
     try:
         import httpx
@@ -278,7 +279,7 @@ def apply_proxy(proxy_url: str) -> None:
 
         logger.info("httpx (CLOB) proxy patch applied — trading calls routed through proxy")
     except ImportError:
-        pass  # httpx not installed — py_clob_client won't be usable anyway
+        pass  # httpx not installed — py_clob_client_v2 won't be usable anyway
 
     # NOTE: requests (Gamma API) is intentionally NOT proxied.
     # Gamma is read-only, not geoblocked, and proxying it through Tor

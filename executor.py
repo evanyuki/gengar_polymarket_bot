@@ -6,7 +6,7 @@ avoid the float precision bug that create_market_order triggers internally
 (amount/price division produces 21.000000000004 shares, rejected by CLOB).
 Sells use create_market_order — the sell path doesn't have the same issue.
 
-Fill verification uses USDC balance change as the source of truth.
+Fill verification uses collateral balance change as the source of truth.
 Ghost fills (order went through despite API exception) are caught via
 balance snapshot before/after. Unverified buys are never cancelled —
 the bot detects them via balance sync at the next window boundary.
@@ -16,15 +16,16 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
-    OrderArgs,
-    MarketOrderArgs,
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
+    OrderArgsV2,
+    MarketOrderArgsV2,
     OrderType,
     BalanceAllowanceParams,
     AssetType,
 )
-from py_clob_client.constants import POLYGON
+from py_clob_client_v2.constants import POLYGON
+from security import redact_secret, sanitize_exception_text
 
 
 FILLED = "FILLED"
@@ -35,7 +36,16 @@ FAILED = "FAILED"
 MIN_SHARES = 1.0
 MIN_AMOUNT_USD = 1.0
 MAX_BUY_PRICE = 0.90  # Allow high-conviction buys — profit comes from resolution at $1.00
-POLY_MIN_NOTIONAL = 5.0  # Polymarket rejects orders below $5 notional
+POLY_MIN_NOTIONAL = 5.0  # Backward-compatible name; CLOB mos=5 means shares, not fixed $5 notional
+
+
+@dataclass
+class MarketMetadata:
+    minimum_order_size: float = POLY_MIN_NOTIONAL
+    minimum_tick_size: float = 0.01
+    fee_rate_bps: float = 0.0
+    maker_base_fee: float = 0.0
+    taker_base_fee: float = 0.0
 
 
 @dataclass
@@ -82,6 +92,9 @@ class Executor:
         self.safe_address = safe_address
         self.client: Optional[ClobClient] = None
         self._initialized = False
+        self.min_order_size = POLY_MIN_NOTIONAL
+        self.tick_size = 0.01
+        self.fee_rate_bps = 0.0
 
     def initialize(self) -> bool:
         try:
@@ -92,17 +105,19 @@ class Executor:
                 funder=self.safe_address if self.safe_address else None,
                 signature_type=2 if self.safe_address else 0,
             )
-            self.client.set_api_creds(self.client.create_or_derive_api_creds())
+            self.client.set_api_creds(self.client.create_or_derive_api_key())
             self._initialized = True
-            print(f"[executor] Initialized ({'DRY RUN' if self.dry_run else 'LIVE'})")
+            print(f"[executor] Initialized py_clob_client_v2 ({'DRY RUN' if self.dry_run else 'LIVE'})")
             print(f"[executor] Max buy price: ${MAX_BUY_PRICE:.2f}")
-            print(f"[executor] Address: {self.client.get_address()}")
+            print(f"[executor] Wallet: {redact_secret(self.client.get_address())}")
+            if self.safe_address:
+                print(f"[executor] Safe/proxy wallet: {redact_secret(self.safe_address)}")
             return True
         except Exception as e:
-            print(f"[executor] Init failed: {e}")
+            print(f"[executor] Init failed: {sanitize_exception_text(e)}")
             return False
 
-    def get_balance(self) -> float:
+    def get_collateral_balance(self) -> float:
         if not self._initialized:
             return 0.0
         try:
@@ -110,10 +125,56 @@ class Executor:
             bal = self.client.get_balance_allowance(params)
             return float(bal.get("balance", 0)) / 1e6
         except Exception as e:
-            print(f"[executor] Balance check failed: {e}")
+            print(f"[executor] Collateral balance check failed: {sanitize_exception_text(e)}")
             return 0.0
 
+    def get_balance(self) -> float:
+        """Backward-compatible alias. Prefer get_collateral_balance()."""
+        return self.get_collateral_balance()
+
+    def get_market_metadata(self, condition_id: str) -> MarketMetadata:
+        """Fetch and cache CLOB market metadata: mos, mts, and platform fee rate.
+
+        CLOB V2 exposes compact keys via get_clob_market_info(condition_id):
+        - mos: minimum order size
+        - mts: minimum tick size
+        - fd.r: platform fee rate used in fee = C × feeRate × p × (1-p)
+        """
+        if not self._initialized or not self.client or not condition_id:
+            return MarketMetadata()
+        try:
+            info = self.client.get_clob_market_info(condition_id)
+            mos = float(info.get("mos") or POLY_MIN_NOTIONAL)
+            mts = float(info.get("mts") or 0.01)
+            fd = info.get("fd") or {}
+            fee_rate = float(fd.get("r") or 0.0)
+            metadata = MarketMetadata(
+                minimum_order_size=mos,
+                minimum_tick_size=mts,
+                fee_rate_bps=round(fee_rate * 10_000.0, 6),
+                maker_base_fee=float(info.get("mbf") or 0.0),
+                taker_base_fee=float(info.get("tbf") or 0.0),
+            )
+            self.min_order_size = metadata.minimum_order_size
+            self.tick_size = metadata.minimum_tick_size
+            self.fee_rate_bps = metadata.fee_rate_bps
+            return metadata
+        except Exception as e:
+            print(f"[executor] Market metadata check failed: {sanitize_exception_text(e)}")
+            return MarketMetadata(
+                minimum_order_size=self.min_order_size,
+                minimum_tick_size=self.tick_size,
+                fee_rate_bps=self.fee_rate_bps,
+            )
+
     # ── Price from complement engine ────────────────────────────────
+
+    def _round_price_to_tick(self, price: float) -> float:
+        tick = float(self.tick_size or 0.01)
+        if tick <= 0:
+            tick = 0.01
+        rounded = round(round(float(price) / tick) * tick, 6)
+        return max(tick, min(1.0 - tick, rounded))
 
     def get_market_price(self, token_id: str, side: str, amount_usd: float) -> float:
         if not self._initialized:
@@ -130,7 +191,17 @@ class Executor:
             err = str(e).lower()
             # Only log genuinely unexpected errors, not "no match" book-empty noise
             if "no match" not in err and "none" not in err:
-                print(f"[executor] Price check failed: {e}")
+                print(f"[executor] Price check failed: {sanitize_exception_text(e)}")
+            return 0.0
+
+    def get_fee_rate_bps(self, token_id: str) -> float:
+        """Return CLOB v2 fee rate in basis points for token metadata."""
+        if not self._initialized or not token_id:
+            return 0.0
+        try:
+            return float(self.client.get_fee_rate_bps(token_id))
+        except Exception as e:
+            print(f"[executor] Fee metadata check failed: {sanitize_exception_text(e)}")
             return 0.0
 
     # ── Buy (market order via complement engine) ─────────────────────
@@ -153,7 +224,7 @@ class Executor:
             )
 
         if self.dry_run:
-            sim_price = 0.55
+            sim_price = round(float(price), 2) if price > 0 else 0.55
             return OrderResult(
                 success=True, order_id=f"DRY-{int(time.time())}",
                 status=FILLED, side="BUY", price=sim_price,
@@ -165,7 +236,7 @@ class Executor:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
 
         if price > 0:
-            market_price = round(price, 2)
+            market_price = self._round_price_to_tick(price)
         else:
             market_price = self.get_market_price(token_id, "BUY", amount_usd)
             if market_price <= 0:
@@ -174,8 +245,7 @@ class Executor:
                     error="Could not get market price", side="BUY",
                     token_id=token_id[:16] + "...",
                 )
-            # Kill float artifacts: 0.7200000001 → 0.72
-            market_price = round(market_price, 2)
+            market_price = self._round_price_to_tick(market_price)
 
         # Price cap: don't buy above MAX_BUY_PRICE
         if market_price > MAX_BUY_PRICE:
@@ -190,7 +260,7 @@ class Executor:
         # floating-point precision that can trip Polymarket's
         # "maker/taker accuracy" validation.
         # - maker (shares): ≤ 4 decimals (we use integers)
-        # - taker (USDC):  ≤ 2 decimals (we use integer cents)
+        # - taker (collateral):  ≤ 2 decimals (we use integer cents)
         shares, clean_amount = calculate_order_size(market_price, amount_usd)
         if shares < 1 or clean_amount <= 0:
             return OrderResult(
@@ -200,11 +270,13 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-        # Re-check minimum notional with clean amount
-        if clean_amount < POLY_MIN_NOTIONAL:
+        # CLOB minimum_order_size is order size (shares) for limit orders.
+        # The dollar spend may be below $5 when price < $1; do not reject a
+        # valid GTC/GTD limit order just because shares × price is < mos.
+        if shares < self.min_order_size:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Amount ${clean_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min",
+                error=f"Size {shares:.0f} shares < {self.min_order_size:.0f} min",
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
@@ -219,11 +291,12 @@ class Executor:
             # NOT create_market_order — that internally divides
             # amount/price producing 21.000000000004 shares, which
             # the CLOB rejects as "invalid amounts, max accuracy 4 decimals".
-            order_args = OrderArgs(
+            order_args = OrderArgsV2(
                 token_id=token_id,
                 price=market_price,       # Already rounded to 2 decimals
                 size=float(int(shares)),  # Integer shares as float
                 side="BUY",
+                user_usdc_balance=balance_before,
             )
             signed_order = self.client.create_order(order_args)
             result = self.client.post_order(signed_order, OrderType.GTC)
@@ -260,7 +333,7 @@ class Executor:
                 )
 
             return OrderResult(
-                success=False, status=FAILED, error=str(e),
+                success=False, status=FAILED, error=sanitize_exception_text(e),
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
@@ -326,9 +399,9 @@ class Executor:
     def sell(self, token_id: str, shares: float, price: float = 0.0) -> OrderResult:
         """Sell shares via create_market_order.
 
-        Verifies the sell via USDC balance change, not order status.
+        Verifies the sell via collateral balance change, not order status.
         Returns shares_remaining for partial fill tracking.
-        Rejects if notional < $5 (Polymarket minimum) — caller should hold to resolution.
+        Rejects if share size is below CLOB minimum_order_size (usually 5 shares) — caller should hold to resolution.
         """
         sell_shares = int(shares)
         if sell_shares < 1:
@@ -361,18 +434,19 @@ class Executor:
                     token_id=token_id[:16] + "...",
                 )
 
-        # Check minimum notional BEFORE attempting — prevents the
-        # "$3.42 lower than minimum: 5" trap that strands shares
-        sell_amount = round(sell_shares * price, 2)
-        if sell_amount < POLY_MIN_NOTIONAL:
+        # Check minimum order size BEFORE attempting. For GTC/GTD CLOB orders,
+        # `min_order_size` is size in shares, not dollar notional.
+        if sell_shares < self.min_order_size:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Notional ${sell_amount:.2f} < ${POLY_MIN_NOTIONAL:.0f} min "
+                error=f"Size {sell_shares:.0f} shares < {self.min_order_size:.0f} min "
                       f"— hold to resolution",
                 side="SELL", price=price, shares=float(sell_shares),
                 shares_remaining=float(sell_shares),
                 token_id=token_id[:16] + "...",
             )
+
+        sell_amount = round(sell_shares * price, 2)
 
         print(f"  📊 Sell: {sell_shares} shares @ ${price:.3f} = ${sell_amount:.2f}")
 
@@ -380,10 +454,13 @@ class Executor:
         balance_before = self.get_balance()
 
         try:
-            order_args = MarketOrderArgs(
+            order_args = MarketOrderArgsV2(
                 token_id=token_id,
-                amount=sell_amount,
+                amount=float(sell_shares),
                 side="SELL",
+                price=price,
+                order_type=OrderType.GTC,
+                user_usdc_balance=balance_before,
             )
 
             signed_order = self.client.create_market_order(order_args)
@@ -397,7 +474,7 @@ class Executor:
             balance_after = self.get_balance()
             received = balance_after - balance_before
 
-            if received > 0.10:  # Got some USDC back
+            if received > 0.10:  # Got collateral back
                 # Estimate shares sold from received amount
                 shares_sold = received / price if price > 0 else 0
                 shares_left = max(0, sell_shares - shares_sold)
@@ -457,7 +534,7 @@ class Executor:
                 )
 
             return OrderResult(
-                success=False, status=FAILED, error=str(e),
+                success=False, status=FAILED, error=sanitize_exception_text(e),
                 side="SELL", price=price, token_id=token_id[:16] + "...",
             )
 
@@ -482,17 +559,17 @@ class Executor:
         try:
             return self.client.get_order(order_id)
         except Exception as e:
-            print(f"[executor] Order check failed: {e}")
+            print(f"[executor] Order check failed: {sanitize_exception_text(e)}")
             return None
 
     def cancel_order(self, order_id: str) -> bool:
         if self.dry_run or not self._initialized:
             return True
         try:
-            self.client.cancel(order_id=order_id)
+            self.client.cancel_orders([order_id])
             return True
         except Exception as e:
-            print(f"[executor] Cancel failed: {e}")
+            print(f"[executor] Cancel failed: {sanitize_exception_text(e)}")
             return False
 
     def cancel_all(self) -> bool:
@@ -502,5 +579,5 @@ class Executor:
             self.client.cancel_all()
             return True
         except Exception as e:
-            print(f"[executor] Cancel all failed: {e}")
+            print(f"[executor] Cancel all failed: {sanitize_exception_text(e)}")
             return False
