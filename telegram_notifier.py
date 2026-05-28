@@ -56,6 +56,29 @@ class TelegramNotifier:
     def loss_alert(self, loss: float, total_pnl: float):
         self.send(f"❌ *LOSS* -${abs(loss):.2f}\nTotal P&L: ${total_pnl:.2f}")
 
+    def six_hour_dry_run_summary(self, window: dict, overall: dict):
+        """Send 6-hour dry-run validation summary."""
+        self.send(
+            "🧪 *6H DRY RUN SUMMARY*\n"
+            "\n"
+            "*Last 6h:*\n"
+            f"  Signals: {window.get('signals', 0)}\n"
+            f"  Trades: {window.get('trades', 0)} ({window.get('wins', 0)}W / {window.get('losses', 0)}L)\n"
+            f"  Win rate: {window.get('win_rate', 0):.1f}%\n"
+            f"  Sim P&L: ${window.get('pnl', 0):+.2f}\n"
+            f"  p(j*,j*) WR: {window.get('threshold_win_rate', 0):.1f}% "
+            f"({window.get('threshold_trades', 0)} trades)\n"
+            "\n"
+            "*Overall dry run:*\n"
+            f"  Hours: {overall.get('hours', 0):.1f}\n"
+            f"  Signals: {overall.get('signals', 0)}\n"
+            f"  Trades: {overall.get('trades', 0)} ({overall.get('wins', 0)}W / {overall.get('losses', 0)}L)\n"
+            f"  Win rate: {overall.get('win_rate', 0):.1f}%\n"
+            f"  Total P&L: ${overall.get('pnl', 0):+.2f}\n"
+            f"  p(j*,j*) WR: {overall.get('threshold_win_rate', 0):.1f}% "
+            f"({overall.get('threshold_trades', 0)} trades)"
+        )
+
     def hourly_summary(self, hourly: dict, overall: dict):
         """Send the full hourly report with all metrics."""
         h = hourly

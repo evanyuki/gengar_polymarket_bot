@@ -26,6 +26,7 @@ import csv
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+from security import sanitize_exception_text
 
 
 # ── Signal record ───────────────────────────────────────────────────
@@ -37,7 +38,7 @@ SIGNAL_FIELDS = [
     "up_price", "down_price", "seconds_remaining",
     # Signal output
     "side", "true_prob", "market_price", "edge",
-    "kelly_size",
+    "kelly_size", "markov_persistence", "fee_rate_bps", "fee_adjusted_edge",
     # What happened
     "action",           # "traded", "skipped_edge_gone", "skipped_below_min",
                         # "skipped_price_cap", "skipped_no_signal", etc.
@@ -53,6 +54,7 @@ SIGNAL_FIELDS = [
 
 TRADE_FIELDS = [
     "timestamp", "window_ts", "window_time", "trade_id",
+    "mode",
     # Entry
     "side", "entry_price", "entry_shares", "entry_cost",
     "edge_at_entry", "prob_at_entry", "btc_delta_at_entry",
@@ -86,12 +88,26 @@ TRADE_FIELDS = [
 
 EXECUTION_FIELDS = [
     "timestamp", "window_ts",
-    "action",                   # "buy", "sell", "get_price", "get_balance",
+    "action",                   # "buy", "sell", "get_price",
                                 # "check_order", "cancel"
     "latency_ms",
     "success",
     "error",
     "details",                  # JSON-safe string with relevant params
+]
+
+GATE_TICK_FIELDS = [
+    "timestamp", "window_ts", "window_time",
+    "btc_price", "adjusted_btc_price", "opening_price", "btc_delta_pct",
+    "up_price", "down_price", "seconds_remaining",
+    "candidate_side", "candidate_market_price", "opposite_market_price",
+    "true_prob", "raw_edge", "fee_adjusted_edge", "kelly_size",
+    "markov_persistence", "markov_same", "markov_total",
+    "markov_directional_samples", "markov_flat_samples", "markov_threshold",
+    "realized_vol", "fee_rate_bps",
+    "source_action", "source_reason", "reference_age_seconds",
+    "basis_bps", "basis_mean_bps", "basis_deviation_bps",
+    "gate_reason", "signal_ready", "extreme_book", "book_state",
 ]
 
 SESSION_FIELDS = [
@@ -104,6 +120,16 @@ SESSION_FIELDS = [
     "avg_entry_price", "avg_edge", "avg_delta",
 ]
 
+DRY_RUN_SESSION_FIELDS = [
+    "window_ts", "window_time", "window_end_time",
+    "signals_detected", "traded", "side",
+    "entry_price", "entry_cost", "entry_shares",
+    "markov_state", "markov_persistence", "markov_threshold",
+    "won_resolution", "simulated_profit",
+    "opening_price", "final_price", "btc_final_delta_pct",
+    "threshold_trades", "threshold_wins", "threshold_win_rate",
+]
+
 
 class Tracker:
     def __init__(self, log_dir: str = "logs", log_executions: bool = False):
@@ -113,17 +139,24 @@ class Tracker:
 
         self._signal_path = os.path.join(log_dir, "signals.csv")
         self._trade_path = os.path.join(log_dir, "trades.csv")
+        self._dry_trade_path = os.path.join(log_dir, "dry_run_trades.csv")
         self._exec_path = os.path.join(log_dir, "executions.csv")
         self._session_path = os.path.join(log_dir, "sessions.csv")
+        self._dry_run_session_path = os.path.join(log_dir, "dry_run_sessions.csv")
+        self._gate_tick_path = os.path.join(log_dir, "gate_ticks.csv")
 
         self._ensure_headers(self._signal_path, SIGNAL_FIELDS)
         self._ensure_headers(self._trade_path, TRADE_FIELDS)
+        self._ensure_headers(self._dry_trade_path, TRADE_FIELDS)
         self._ensure_headers(self._session_path, SESSION_FIELDS)
+        self._ensure_headers(self._dry_run_session_path, DRY_RUN_SESSION_FIELDS)
+        self._ensure_headers(self._gate_tick_path, GATE_TICK_FIELDS)
         if self.log_executions:
             self._ensure_headers(self._exec_path, EXECUTION_FIELDS)
 
         # In-memory state for current trade
         self._current_trade: dict = {}
+        self._current_trade_path: str = self._trade_path
         self._trade_counter: int = 0
 
         # Session stats
@@ -158,6 +191,9 @@ class Tracker:
         market_price: float = 0.0,
         edge: float = 0.0,
         kelly_size: float = 0.0,
+        markov_persistence: float = 0.0,
+        fee_rate_bps: float = 0.0,
+        fee_adjusted_edge: float = 0.0,
         # Outcome
         action: str = "no_signal",
         skip_reason: str = "",
@@ -197,6 +233,9 @@ class Tracker:
             "market_price": round(market_price, 4),
             "edge": round(edge, 4),
             "kelly_size": round(kelly_size, 2),
+            "markov_persistence": round(markov_persistence, 4),
+            "fee_rate_bps": round(fee_rate_bps, 4),
+            "fee_adjusted_edge": round(fee_adjusted_edge, 4),
             "action": action,
             "skip_reason": skip_reason,
             "actual_price": round(actual_price, 4),
@@ -205,6 +244,74 @@ class Tracker:
             "slippage": round(slippage, 4),
         }
         self._append_row(self._signal_path, row, SIGNAL_FIELDS)
+
+    def log_gate_tick(
+        self,
+        window_ts: int,
+        btc_price: float,
+        adjusted_btc_price: float,
+        opening_price: float,
+        up_price: float,
+        down_price: float,
+        seconds_remaining: float,
+        candidate_side: str,
+        candidate_market_price: float,
+        opposite_market_price: float,
+        true_prob: float,
+        raw_edge: float,
+        fee_adjusted_edge: float,
+        kelly_size: float,
+        markov_persistence: float,
+        markov_stats: Optional[dict] = None,
+        markov_threshold: float = 0.0,
+        realized_vol: float = 0.0,
+        fee_rate_bps: float = 0.0,
+        source_decision=None,
+        gate_reason: str = "",
+        signal_ready: bool = False,
+        extreme_book: bool = False,
+        book_state: str = "",
+    ):
+        markov_stats = markov_stats or {}
+        btc_delta_pct = ((adjusted_btc_price - opening_price) / opening_price * 100) if opening_price > 0 else 0.0
+        row = {
+            "timestamp": time.time(),
+            "window_ts": window_ts,
+            "window_time": time.strftime("%H:%M", time.localtime(window_ts)),
+            "btc_price": round(btc_price, 2),
+            "adjusted_btc_price": round(adjusted_btc_price, 2),
+            "opening_price": round(opening_price, 2),
+            "btc_delta_pct": round(btc_delta_pct, 4),
+            "up_price": round(up_price, 3),
+            "down_price": round(down_price, 3),
+            "seconds_remaining": round(seconds_remaining, 1),
+            "candidate_side": candidate_side,
+            "candidate_market_price": round(candidate_market_price, 4),
+            "opposite_market_price": round(opposite_market_price, 4),
+            "true_prob": round(true_prob, 4),
+            "raw_edge": round(raw_edge, 4),
+            "fee_adjusted_edge": round(fee_adjusted_edge, 4),
+            "kelly_size": round(kelly_size, 2),
+            "markov_persistence": round(markov_persistence, 4),
+            "markov_same": int(markov_stats.get("same", 0)),
+            "markov_total": int(markov_stats.get("total", 0)),
+            "markov_directional_samples": int(markov_stats.get("directional_samples", 0)),
+            "markov_flat_samples": int(markov_stats.get("flat_samples", 0)),
+            "markov_threshold": round(markov_threshold, 4),
+            "realized_vol": round(realized_vol, 4),
+            "fee_rate_bps": round(fee_rate_bps, 4),
+            "source_action": getattr(source_decision, "action", ""),
+            "source_reason": getattr(source_decision, "reason", ""),
+            "reference_age_seconds": round(getattr(source_decision, "reference_age_seconds", 0.0) or 0.0, 3),
+            "basis_bps": round(getattr(source_decision, "basis_bps", 0.0) or 0.0, 4),
+            "basis_mean_bps": round(getattr(source_decision, "basis_mean_bps", 0.0) or 0.0, 4),
+            "basis_deviation_bps": round(getattr(source_decision, "basis_deviation_bps", 0.0) or 0.0, 4),
+            "gate_reason": gate_reason,
+            "signal_ready": int(bool(signal_ready)),
+            "extreme_book": int(bool(extreme_book)),
+            "book_state": book_state,
+        }
+        self._append_row(self._gate_tick_path, row, GATE_TICK_FIELDS)
 
     # ── Trade lifecycle ─────────────────────────────────────────────
 
@@ -222,13 +329,17 @@ class Tracker:
         latency_ms: float = 0.0,
         entry_delta_pct: float = 0.0,
         entry_seconds_remaining: float = 0.0,
+        mode: str = "LIVE",
     ):
+        mode = "DRY" if str(mode).upper() in {"DRY", "DRY_RUN", "PAPER"} else "LIVE"
         self._trade_counter += 1
+        self._current_trade_path = self._dry_trade_path if mode == "DRY" else self._trade_path
         self._current_trade = {
             "timestamp": time.time(),
             "window_ts": window_ts,
             "window_time": time.strftime("%H:%M", time.localtime(window_ts)),
             "trade_id": self._trade_counter,
+            "mode": mode,
             "side": side,
             "entry_price": round(entry_price, 4),
             "entry_shares": round(entry_shares, 1),
@@ -329,8 +440,9 @@ class Tracker:
             self._current_trade["min_sell_price_seen"] = 0.0
 
         # Write the complete trade record
-        self._append_row(self._trade_path, self._current_trade, TRADE_FIELDS)
+        self._append_row(self._current_trade_path, self._current_trade, TRADE_FIELDS)
         self._current_trade = {}
+        self._current_trade_path = self._trade_path
 
     # ── Execution logging ───────────────────────────────────────────
 
@@ -355,8 +467,8 @@ class Tracker:
             "action": action,
             "latency_ms": round(latency_ms, 1),
             "success": success,
-            "error": error,
-            "details": details[:200],  # Truncate long error messages
+            "error": sanitize_exception_text(error),
+            "details": sanitize_exception_text(details)[:200],  # Truncate long error messages
         }
         self._append_row(self._exec_path, row, EXECUTION_FIELDS)
 
@@ -441,6 +553,55 @@ class Tracker:
         }
         self._append_row(self._session_path, row, SESSION_FIELDS)
 
+    def log_dry_run_session(
+        self,
+        window_ts: int,
+        window_end_ts: int,
+        signals_detected: int,
+        traded: bool,
+        side: str = "",
+        entry_price: float = 0.0,
+        entry_cost: float = 0.0,
+        entry_shares: float = 0.0,
+        markov_state: str = "",
+        markov_persistence: float = 0.0,
+        markov_threshold: float = 0.0,
+        simulated_profit: float = 0.0,
+        won_resolution: bool | str = "",
+        opening_price: float = 0.0,
+        final_price: float = 0.0,
+        btc_final_delta_pct: float = 0.0,
+        threshold_trades: int = 0,
+        threshold_wins: int = 0,
+    ):
+        """Append one completed 5-minute dry-run market session."""
+        threshold_win_rate = (
+            threshold_wins / threshold_trades * 100 if threshold_trades > 0 else 0.0
+        )
+        row = {
+            "window_ts": window_ts,
+            "window_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(window_ts)),
+            "window_end_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(window_end_ts)),
+            "signals_detected": int(signals_detected),
+            "traded": bool(traded),
+            "side": side,
+            "entry_price": round(entry_price, 4),
+            "entry_cost": round(entry_cost, 2),
+            "entry_shares": round(entry_shares, 4),
+            "markov_state": markov_state,
+            "markov_persistence": round(markov_persistence, 4),
+            "markov_threshold": round(markov_threshold, 4),
+            "won_resolution": won_resolution,
+            "simulated_profit": round(simulated_profit, 2),
+            "opening_price": round(opening_price, 2),
+            "final_price": round(final_price, 2),
+            "btc_final_delta_pct": round(btc_final_delta_pct, 4),
+            "threshold_trades": threshold_trades,
+            "threshold_wins": threshold_wins,
+            "threshold_win_rate": round(threshold_win_rate, 1),
+        }
+        self._append_row(self._dry_run_session_path, row, DRY_RUN_SESSION_FIELDS)
+
     # ── Internal ────────────────────────────────────────────────────
 
     def _ensure_headers(self, path: str, fields: list):
@@ -448,6 +609,26 @@ class Tracker:
             with open(path, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fields)
                 writer.writeheader()
+            return
+
+        # Schema migration: append-only CSVs may already exist from older bot
+        # versions. If a new observability column is added, rewrite only the
+        # header/rows to include it, preserving all historical values.
+        try:
+            with open(path, newline="") as f:
+                reader = csv.DictReader(f)
+                existing_fields = reader.fieldnames or []
+                if all(field in existing_fields for field in fields):
+                    return
+                rows = list(reader)
+
+            with open(path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({field: row.get(field, "") for field in fields})
+        except Exception as e:
+            print(f"[tracker] Header migration failed for {path}: {e}")
 
     def _append_row(self, path: str, row: dict, fields: list):
         # Only write fields that exist in the schema
