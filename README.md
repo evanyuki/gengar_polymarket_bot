@@ -61,9 +61,9 @@ Configurable via `DAILY_LOSS_LIMIT` in `.env` (default: $30). Compares session P
 
 ### Balance-verified everything
 
-- **Buys**: Snapshot USDC before order, verify balance drop after. Ghost fills (order succeeds on-chain despite API exception) are caught via balance change.
+- **Buys**: Snapshot collateral before order, verify balance drop after. Ghost fills (order succeeds on-chain despite API exception) are caught via balance change.
 - **Sells**: Balance-verified with partial fill tracking.
-- **Window sync**: Real USDC balance queried at every window boundary, overwrites internal tracking. Drift > $0.50 is logged.
+- **Window sync**: Real collateral balance queried at every window boundary, overwrites internal tracking. Drift > $0.50 is logged.
 - **Pending buy safety net**: If a buy can't be verified within 14s, details are saved. Next window boundary detects the fill via balance drop and retroactively tracks the position.
 
 ### Minimum notional guard
@@ -148,7 +148,7 @@ These are architectural decisions made from live trading data, not theory:
 
 - **Two-book architecture**: Polymarket has a raw token book (illiquid, wide spreads) and a complement engine book (tight spreads, real volume). All orders must route through the complement engine — the raw book is effectively unusable.
 - **Ghost orders are real fills**: Network exceptions on buys don't mean the order failed. On-chain fills can occur silently. Always verify via balance change, never trust the API response alone.
-- **Float precision kills orders**: `py-clob-client` internally computes `shares × (1 - price)` using float math. `1.0 - 0.71 = 0.29000000000000004` in IEEE 754. The bot uses `create_order` with explicit integer shares to avoid this.
+- **Float precision kills orders**: `py-clob-client-v2` can still hit float artifacts on some market-order amount calculations. The bot uses `create_order` with explicit integer shares for buys to avoid this.
 - **Stops destroy value on 5-min windows**: Prob-stop fired 5 times in testing. 4 of 5 stopped trades won at resolution. Cost: $35.45. BTC micro-bounces trigger panic sells that the 5-minute trend ultimately reverses.
 - **Model calibration matters more than strategy complexity**: Doubling the vol parameter from 0.08 to 0.12 (based on 15 trades of calibration data) turned a -35% ROC strategy into a +55% ROC strategy. Same code, different constant.
 
@@ -156,7 +156,7 @@ These are architectural decisions made from live trading data, not theory:
 
 - **Ghost fills during outages**: When the CLOB confirmation pipeline is down, orders can still execute on-chain. The `get_ok()` circuit breaker prevents *new* orders, but can't recall orders already submitted.
 - **Tor latency**: Routing through Tor adds 200-500ms per API call. The total buy flow is 8-15 seconds. This is acceptable for 5-minute windows but would be a problem for faster markets.
-- **Stranded shares**: Winning positions below $5 notional can't be sold via the API. They auto-resolve on Polymarket but the USDC may take time to appear.
+- **Stranded shares**: Winning positions below $5 notional can't be sold via the API. They auto-resolve on Polymarket but the collateral may take time to appear.
 
 ## Risk warning
 

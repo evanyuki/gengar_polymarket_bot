@@ -2,7 +2,7 @@
 
 ## What this is
 
-An algorithmic trading bot ("PolyBot") for Polymarket's 5-minute BTC Up/Down binary markets. The strategy exploits oracle lag between Binance real-time BTC prices and Polymarket's delayed repricing. Built in Python, runs locally, trades real USDC on Polygon.
+An algorithmic trading bot ("PolyBot") for Polymarket's 5-minute BTC Up/Down binary markets. The strategy exploits oracle lag between Binance real-time BTC prices and Polymarket's delayed repricing. Built in Python, runs locally, trades real collateral on Polygon.
 
 ## Owner
 
@@ -25,7 +25,7 @@ proxy.py            → Tor proxy for CLOB API geo-restrictions
 
 ### Key dependencies
 
-- `py-clob-client` v0.34.6 — Polymarket CLOB SDK
+- `py-clob-client-v2` v1.0.1+ — Polymarket CLOB V2 SDK (required after April 28, 2026 exchange upgrade)
 - Binance WebSocket — real-time BTC price feed
 - Polymarket Gamma API (`gamma-api.polymarket.com`) — market discovery
 
@@ -59,11 +59,17 @@ Every 5 minutes, Polymarket opens a market: "Will BTC be higher or lower?" Share
 
 ### Position sizing
 
-Quarter-Kelly criterion. `kelly_f = (b*p - q) / b` where `b = (1-price)/price`. Then `bet = bankroll × kelly_f × 0.25`. Bounded: `$5 ≤ bet ≤ $25`.
+Quarter-Kelly criterion. `kelly_f = (b*p - q) / b` where `b = (1-price)/price`. Then `bet = bankroll × kelly_f × 0.25`. Bounded by configured `MIN_BET`/`MAX_BET`. For LIVE GTC/GTD limit orders, Polymarket's `minimum_order_size` is shares (BTC 5m commonly 5 shares), not a fixed $5 notional; the executable minimum spend is approximately `min_order_size × price`, with a separate $1 budget floor for the executor.
 
-### Exit: Hold to resolution (no stops)
+### Exit: stop-loss/prob-stop when enabled, otherwise hold to resolution
 
-All trades hold until the 5-minute window closes. No prob-stop, no price-stop, no take-profit, no forced exit. Data showed stops cost $35.45 across 5 fires (4 of 5 stopped trades won at resolution). The 5-minute window is too short for stops to work — BTC micro-bounces trigger panic sells that reverse.
+Current code supports optional exits during the 5-minute window:
+- `STOP_LOSS_ENABLED=true` (default currently in code) enables a price stop and probability stop.
+- Price stop: current sell price <= entry price × `(1 - STOP_LOSS_PCT)`.
+- Probability stop: model probability for held side <= `STOP_PROB_FLOOR`.
+- If `STOP_LOSS_ENABLED=false`, the bot holds to resolution.
+
+Important: older analysis showed stops can destroy value in this market because BTC micro-bounces can trigger exits that later resolve correctly. Treat stops as an explicit live-risk choice, not the default strategy thesis. The bot startup and trade-entry logs must state the actual active exit policy.
 
 ---
 
@@ -83,7 +89,7 @@ If `session_pnl ≤ -DAILY_LOSS_LIMIT` (default $30): halt all trading, Telegram
 
 ### 3. Balance-verified buys
 
-- Snapshot USDC before order
+- Snapshot collateral before order
 - Wait 5s + 3 verification rounds (balance check + order API check + 3s wait each)
 - Ghost fills caught via balance drop even when API throws exception
 - NEVER cancel on timeout — returns `UNVERIFIED_BUY` for pending detection
@@ -97,7 +103,7 @@ If buy can't be verified in 14s, save order details. Next window boundary:
 
 ### 5. Window-boundary balance sync
 
-Every new window: query real USDC balance, overwrite internal tracking. Logs drift > $0.50. This is the ultimate source of truth that corrects any accumulated errors.
+Every new window: query real collateral balance, overwrite internal tracking. Logs drift > $0.50. This is the ultimate source of truth that corrects any accumulated errors.
 
 ### 6. Minimum notional guard
 
@@ -117,7 +123,7 @@ All orders MUST route through the complement engine. `create_order(OrderArgs)` r
 
 ### Float precision — the decimal bug
 
-The py-clob-client library internally computes `shares × (1 - price)` using float math:
+The py-clob-client-v2 library may still compute complement amounts with float math on some market-order paths:
 ```python
 1.0 - 0.71 = 0.29000000000000004  # IEEE 754 artifact
 21 * 0.29000000000000004 * 1e6 = 6090000.000000001  # Violates 4-decimal rule
@@ -135,7 +141,7 @@ Sells still use `create_market_order` because the sell path doesn't have the sam
 
 `clobTokenIds` and `outcomes` fields return as JSON strings, not native JSON. Always parse with `json.loads()`.
 
-### USDC decimals
+### collateral decimals
 
 Balance API returns 6 decimals (1e6). Conditional tokens are ERC-1155 requiring per-token approval.
 

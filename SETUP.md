@@ -9,7 +9,7 @@ This guide walks you through setting up PolyBot from scratch — a trading bot f
 
 ## What you'll need
 
-- A Polymarket account funded with USDC
+- A Polymarket account funded with collateral
 - A Polygon wallet (private key)
 - Python 3.10+
 - Tor (for geo-restriction bypass)
@@ -49,7 +49,7 @@ pip install -r requirements.txt
 ```
 
 The key packages this installs:
-- `py-clob-client` — Polymarket CLOB SDK for order execution
+- `py-clob-client-v2` — Polymarket CLOB V2 SDK for order execution
 - `python-dotenv` — reads your `.env` config file
 - `websockets` + `aiohttp` — Binance real-time price feed
 - `httpx[socks]` + `pysocks` — Tor SOCKS5 proxy routing
@@ -88,7 +88,7 @@ If Tor bootstrap fails or trading starts getting rejected, just restart the bot 
 
 ## Step 4 — Polymarket wallet setup
 
-You need a Polygon wallet with USDC deposited on Polymarket. There are two wallet configurations:
+You need a Polygon wallet with collateral deposited on Polymarket. There are two wallet configurations:
 
 ### Option A: Standard EOA wallet (simpler)
 
@@ -108,10 +108,10 @@ If using a Safe, set `SAFE_ADDRESS` in `.env` to that address and `signature_typ
 
 1. Go to [polymarket.com](https://polymarket.com)
 2. Connect your wallet
-3. Deposit USDC via the UI (bridges from Ethereum or direct on Polygon)
+3. Deposit collateral via the UI (bridges from Ethereum or direct on Polygon)
 4. Recommended starting balance: **$50–$100** to start
 
-> **Note:** The bot tracks bankroll internally. Set `BANKROLL` in `.env` to match your actual USDC balance on Polymarket when you start.
+> **Note:** The bot tracks bankroll internally. Set `BANKROLL` in `.env` to match your actual collateral balance on Polymarket when you start.
 
 ---
 
@@ -160,7 +160,7 @@ ENTRY_WINDOW_END=10
 KELLY_FRACTION=0.25
 MIN_BET=5.0
 MAX_BET=25.0
-BANKROLL=100.0   # set this to your actual USDC balance on Polymarket
+BANKROLL=100.0   # set this to your actual collateral balance on Polymarket
 
 # ── Safety ───────────────────────────────────────────────────────────
 DAILY_LOSS_LIMIT=30   # bot halts trading if session P&L drops below -$30
@@ -240,7 +240,7 @@ The bot will then wait for trading opportunities, printing each 5-minute window 
 When dry-run looks healthy for a session or two:
 
 1. Set `DRY_RUN=false` in `.env`
-2. Confirm `BANKROLL` matches your actual Polymarket USDC balance
+2. Confirm `BANKROLL` matches your actual Polymarket collateral balance
 3. Set `DAILY_LOSS_LIMIT` to a number you're comfortable losing in one day
 4. Run:
 
@@ -280,7 +280,7 @@ The bot has several automatic safeguards:
 
 **Pending buy safety net** — If an order can't be verified within ~14 seconds, it's flagged as `UNVERIFIED_BUY`. At the next window boundary, the bot checks your real balance — if it dropped, the order is retroactively tracked as filled. Orders are **never cancelled** on timeout.
 
-**Window-boundary balance sync** — Every 5 minutes, the bot queries your real USDC balance and overwrites internal tracking. This corrects any accumulated drift.
+**Window-boundary balance sync** — Every 5 minutes, the bot queries your real collateral balance and overwrites internal tracking. This corrects any accumulated drift.
 
 ---
 
@@ -300,7 +300,7 @@ This is the float precision bug. Make sure you're on the latest `bot.py` — the
 ### Orders not filling / always getting rejected
 - The CLOB API may be blocking your Tor exit node — restart the bot to get a new circuit
 - Check `https://status.polymarket.com` for outages
-- Verify your USDC balance is sufficient (minimum $5 per order)
+- Verify your collateral balance is sufficient (minimum $5 per order)
 
 ### No trades firing in dry-run
 This is normal if BTC isn't moving significantly. The model requires an 80% probability signal, which only fires on genuine moves (0.10%+ within a 5-minute window). You may watch several empty windows before seeing a signal.
@@ -348,7 +348,7 @@ WantedBy=multi-user.target
 
 ## Key facts to understand before going live
 
-1. **This trades real USDC on Polygon.** Start with a small bankroll ($50–$100) and observe several sessions.
+1. **This trades real collateral on Polygon.** Start with a small bankroll ($50–$100) and observe several sessions.
 
 2. **The strategy holds all positions to resolution** (no stops, no take-profits). This is intentional — data showed stops cost more than they saved in 5-minute windows.
 
