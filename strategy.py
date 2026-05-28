@@ -22,6 +22,13 @@ class TradeSignal:
     true_prob: float
     seconds_remaining: float
     kelly_size: float
+    gap: float = 0.0
+    fee_adjusted_edge: float = 0.0
+    fee_rate_bps: float = 0.0
+    markov_persistence: float = 0.0
+    markov_regime: str = "markov_strong"
+    edge_required: float = 0.05
+    markov_size_multiplier: float = 1.0
 
 
 @dataclass
@@ -34,8 +41,28 @@ class StrategyConfig:
     min_price: float = 0.50
     min_btc_delta: float = 0.06     # minimum |btc_delta_pct| — below this the oracle and Binance can disagree
     kelly_fraction: float = 0.25    # Quarter-Kelly (conservative)
-    min_bet: float = 5.0            # Polymarket minimum notional
+    min_bet: float = 5.0            # strategy/order budget floor in dollars; CLOB size min is shares
     max_bet: float = 25.0           # Hard cap per trade
+    markov_persistence_threshold: float = 0.87
+    markov_medium_threshold: float = 0.75
+    markov_weak_min_transitions: int = 5
+    markov_medium_edge: float = 0.07
+    markov_weak_edge: float = 0.08
+    markov_insufficient_edge: float = 0.10
+    markov_medium_size_multiplier: float = 0.50
+    markov_weak_size_multiplier: float = 0.35
+    markov_insufficient_size_multiplier: float = 0.25
+    high_price_edge_buffer_threshold: float = 0.80
+    high_price_min_edge: float = 0.08
+
+
+@dataclass
+class MarkovRiskModifier:
+    regime: str
+    allowed: bool
+    edge_required: float
+    size_multiplier: float
+    raw_persistence: float
 
 
 @dataclass
@@ -157,6 +184,48 @@ class TradingStats:
         }
 
 
+def fee_rate_decimal(fee_rate_bps: float = 0.0) -> float:
+    """Convert basis points from CLOB v2 metadata into a decimal rate."""
+    return max(0.0, float(fee_rate_bps or 0.0)) / 10_000.0
+
+
+def effective_market_price(market_price: float, fee_rate_bps: float = 0.0) -> float:
+    """Fee-aware effective entry cost per share.
+
+    Polymarket's documented fee formula is:
+        fee = C × feeRate × p × (1 - p)
+    where C is shares and p is price. Per share, the fee is therefore
+    feeRate × p × (1 - p). Do not model fees as price × (1 + feeRate): that
+    overstates high-price fees and can incorrectly force Kelly size to zero.
+
+    Entry formula still uses the requested raw gap:
+        Δ⁽ʷ⁾ = p̂⁽ʷ⁾ − q⁽ʷ⁾, q = market price
+
+    This helper is for EV/Kelly sizing so fees reduce size without changing
+    the raw entry-gap definition.
+    """
+    fee_rate = fee_rate_decimal(fee_rate_bps)
+    return market_price + fee_rate * market_price * (1.0 - market_price)
+
+
+def fee_adjusted_edge(true_prob: float, market_price: float, fee_rate_bps: float = 0.0) -> float:
+    return true_prob - effective_market_price(market_price, fee_rate_bps)
+
+
+def kelly_fraction(true_prob: float, market_price: float, fee_rate_bps: float = 0.0) -> float:
+    """Explicit Kelly criterion: f* = p − (1−p)/b.
+
+    For a binary market bought at q, b is net odds. With fees, q is replaced
+    only for sizing by the effective entry cost; the entry signal still uses
+    raw Δ⁽ʷ⁾ = p̂⁽ʷ⁾ − q⁽ʷ⁾.
+    """
+    effective_price = effective_market_price(market_price, fee_rate_bps)
+    if effective_price <= 0 or effective_price >= 1:
+        return 0.0
+    b = (1.0 - effective_price) / effective_price
+    return true_prob - (1.0 - true_prob) / b
+
+
 def kelly_bet_size(
     true_prob: float,
     market_price: float,
@@ -164,21 +233,10 @@ def kelly_bet_size(
     fraction: float = 0.25,
     min_bet: float = 1.0,
     max_bet: float = 25.0,
+    fee_rate_bps: float = 0.0,
 ) -> float:
-    """Calculate Kelly criterion bet size.
-
-    Binary market: buy at market_price, win pays $1.
-      b = (1 - market_price) / market_price   (net odds)
-      kelly_f = (b * p - q) / b
-
-    Uses fractional Kelly (default 0.25 = quarter Kelly) for safety.
-    """
-    if market_price <= 0 or market_price >= 1:
-        return 0.0
-
-    b = (1.0 - market_price) / market_price
-    q = 1.0 - true_prob
-    kelly_f = (b * true_prob - q) / b
+    """Calculate fee-aware Kelly bet size using fractional Kelly."""
+    kelly_f = kelly_fraction(true_prob, market_price, fee_rate_bps)
 
     if kelly_f <= 0:
         return 0.0
@@ -209,6 +267,63 @@ def estimate_true_probability(
     return min(max(prob, 0.01), 0.99)
 
 
+def markov_risk_modifier(
+    markov_persistence: float,
+    markov_stats: Optional[dict],
+    market_price: float,
+    config: "StrategyConfig",
+) -> MarkovRiskModifier:
+    """Convert Markov diagnostics into edge and sizing requirements.
+
+    Markov is deliberately not a simple hard gate. The live data showed that
+    many 5-minute oracle-lag opportunities appear before the 60s Markov sample
+    has enough non-flat transitions. Treat insufficient samples as higher risk
+    requiring thicker edge and smaller size; only hard-skip when there is enough
+    evidence and persistence is genuinely low.
+    """
+    stats = markov_stats or {}
+    total = int(stats.get("total") or 0)
+    same = int(stats.get("same") or 0)
+    raw_persistence = same / total if total > 0 else float(markov_persistence or 0.0)
+
+    if total >= 8 and raw_persistence >= config.markov_persistence_threshold:
+        regime = "markov_strong"
+        allowed = True
+        edge_required = config.min_edge
+        size_multiplier = 1.0
+    elif total >= 8 and raw_persistence >= config.markov_medium_threshold:
+        regime = "markov_medium"
+        allowed = True
+        edge_required = config.markov_medium_edge
+        size_multiplier = config.markov_medium_size_multiplier
+    elif total >= config.markov_weak_min_transitions and raw_persistence >= config.markov_medium_threshold:
+        regime = "markov_weak_sample_positive"
+        allowed = True
+        edge_required = config.markov_weak_edge
+        size_multiplier = config.markov_weak_size_multiplier
+    elif total < config.markov_weak_min_transitions:
+        regime = "markov_insufficient_sample"
+        allowed = True
+        edge_required = config.markov_insufficient_edge
+        size_multiplier = config.markov_insufficient_size_multiplier
+    else:
+        regime = "markov_low_persistence"
+        allowed = False
+        edge_required = config.markov_weak_edge
+        size_multiplier = 0.0
+
+    if market_price >= config.high_price_edge_buffer_threshold and regime != "markov_strong":
+        edge_required = max(edge_required, config.high_price_min_edge)
+
+    return MarkovRiskModifier(
+        regime=regime,
+        allowed=allowed,
+        edge_required=edge_required,
+        size_multiplier=size_multiplier,
+        raw_persistence=raw_persistence,
+    )
+
+
 def get_skip_reason(
     btc_price: float,
     opening_price: float,
@@ -217,6 +332,9 @@ def get_skip_reason(
     seconds_remaining: float,
     config: "StrategyConfig" = None,
     realized_vol: float = None,
+    markov_persistence: float = 1.0,
+    markov_stats: Optional[dict] = None,
+    fee_rate_bps: float = 0.0,
 ) -> str:
     """Return why evaluate() returned None, for signal logging.
 
@@ -229,6 +347,10 @@ def get_skip_reason(
         config = StrategyConfig()
     if opening_price <= 0:
         return ""
+    if seconds_remaining > config.entry_window_start:
+        return "before_entry_window"
+    if seconds_remaining < config.entry_window_end:
+        return "after_entry_window"
     btc_delta_pct = ((btc_price - opening_price) / opening_price) * 100
     if abs(btc_delta_pct) < config.min_btc_delta:
         return "delta_too_small"
@@ -241,8 +363,25 @@ def get_skip_reason(
     if true_prob < config.min_prob:
         return "prob_below_min"
     edge = true_prob - market_price
+    risk = markov_risk_modifier(markov_persistence, markov_stats, market_price, config)
+    if not risk.allowed:
+        return risk.regime
     if edge < config.min_edge:
         return "edge_below_min"
+    net_edge = fee_adjusted_edge(true_prob, market_price, fee_rate_bps)
+    bet_size = kelly_bet_size(
+        true_prob=true_prob,
+        market_price=market_price,
+        bankroll=1.0,
+        fraction=config.kelly_fraction,
+        min_bet=config.min_bet,
+        max_bet=config.max_bet,
+        fee_rate_bps=fee_rate_bps,
+    )
+    if bet_size <= 0:
+        return "kelly_below_min"
+    if net_edge < risk.edge_required:
+        return "markov_edge_buffer_below_required"
     return ""
 
 
@@ -255,6 +394,9 @@ def evaluate(
     bankroll: float = 100.0,
     config: StrategyConfig = None,
     realized_vol: float = None,
+    markov_persistence: float = 1.0,
+    markov_stats: Optional[dict] = None,
+    fee_rate_bps: float = 0.0,
 ) -> Optional[TradeSignal]:
     """Evaluate whether to enter a trade.
 
@@ -293,9 +435,18 @@ def evaluate(
     if true_prob < config.min_prob:
         return None
 
-    # Filter 2: Must have real edge over market price
-    edge = true_prob - market_price
-    if edge < config.min_edge:
+    # Entry formula: Δ⁽ʷ⁾ = p̂⁽ʷ⁾ − q⁽ʷ⁾ ≥ ε → ENTER
+    # q is the raw market price. Fees are accounted for separately in EV/Kelly.
+    gap = true_prob - market_price
+    if gap < config.min_edge:
+        return None
+
+    risk = markov_risk_modifier(markov_persistence, markov_stats, market_price, config)
+    if not risk.allowed:
+        return None
+
+    net_edge = fee_adjusted_edge(true_prob, market_price, fee_rate_bps)
+    if net_edge < risk.edge_required:
         return None
 
     bet_size = kelly_bet_size(
@@ -305,17 +456,30 @@ def evaluate(
         fraction=config.kelly_fraction,
         min_bet=config.min_bet,
         max_bet=config.max_bet,
+        fee_rate_bps=fee_rate_bps,
     )
 
-    confidence = min(edge / 0.10, 1.0)
+    if bet_size <= 0:
+        return None
+
+    bet_size = round(max(config.min_bet, bet_size * risk.size_multiplier), 2)
+
+    confidence = min(gap / 0.10, 1.0)
 
     return TradeSignal(
         side=side,
         confidence=confidence,
         btc_delta_pct=btc_delta_pct,
         market_price=market_price,
-        edge=edge,
+        edge=gap,
         true_prob=true_prob,
         seconds_remaining=seconds_remaining,
         kelly_size=bet_size,
+        gap=gap,
+        fee_adjusted_edge=net_edge,
+        fee_rate_bps=fee_rate_bps,
+        markov_persistence=markov_persistence,
+        markov_regime=risk.regime,
+        edge_required=risk.edge_required,
+        markov_size_multiplier=risk.size_multiplier,
     )
