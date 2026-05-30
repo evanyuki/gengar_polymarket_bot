@@ -24,7 +24,6 @@ Usage:
 import os
 import csv
 import time
-from dataclasses import dataclass, field, asdict
 from typing import Optional
 from security import sanitize_exception_text
 
@@ -48,6 +47,9 @@ SIGNAL_FIELDS = [
     "actual_edge",      # Edge at actual price
     "fill_price",       # What we actually paid (0 if not traded)
     "slippage",         # fill_price - market_price (0 if not traded)
+    "book_best_bid", "book_best_ask", "book_worst_ask_at_cap",
+    "book_cap_price", "book_depth_shares_at_cap", "book_required_shares",
+    "book_depth_usd_at_cap", "book_age_ms", "book_depth_enough",
 ]
 
 # ── Trade record ────────────────────────────────────────────────────
@@ -77,7 +79,7 @@ TRADE_FIELDS = [
     "btc_final_price", "btc_final_delta_pct",
     "won_resolution",           # Did BTC go our way?
     "resolution_payout",        # What resolution would have paid
-    "resolution_method",        # "claim_sell", "balance_check", "binance_fallback", "exited"
+    "resolution_method",        # "claim_sell", "balance_check", "official_csv", "dry_binance_fallback", "exited"
     "claim_result",             # "filled", "no_match", "inconclusive", "not_attempted"
     # P&L
     "profit", "return_pct",
@@ -107,6 +109,8 @@ GATE_TICK_FIELDS = [
     "realized_vol", "fee_rate_bps",
     "source_action", "source_reason", "reference_age_seconds",
     "basis_bps", "basis_mean_bps", "basis_deviation_bps",
+    "momentum_15s_pct", "momentum_30s_pct", "entry_spread", "book_imbalance",
+    "time_bucket", "delta_bucket", "prob_bucket", "price_bucket", "edge_bucket",
     "gate_reason", "signal_ready", "extreme_book", "book_state",
 ]
 
@@ -200,6 +204,15 @@ class Tracker:
         actual_price: float = 0.0,
         actual_edge: float = 0.0,
         fill_price: float = 0.0,
+        book_best_bid: float = 0.0,
+        book_best_ask: float = 0.0,
+        book_worst_ask_at_cap: float = 0.0,
+        book_cap_price: float = 0.0,
+        book_depth_shares_at_cap: float = 0.0,
+        book_required_shares: float = 0.0,
+        book_depth_usd_at_cap: float = 0.0,
+        book_age_ms: float = 0.0,
+        book_depth_enough: bool = False,
     ):
         self._signals_total += 1
         if action == "traded":
@@ -242,6 +255,15 @@ class Tracker:
             "actual_edge": round(actual_edge, 4),
             "fill_price": round(fill_price, 4),
             "slippage": round(slippage, 4),
+            "book_best_bid": round(book_best_bid, 4),
+            "book_best_ask": round(book_best_ask, 4),
+            "book_worst_ask_at_cap": round(book_worst_ask_at_cap, 4),
+            "book_cap_price": round(book_cap_price, 4),
+            "book_depth_shares_at_cap": round(book_depth_shares_at_cap, 4),
+            "book_required_shares": round(book_required_shares, 4),
+            "book_depth_usd_at_cap": round(book_depth_usd_at_cap, 4),
+            "book_age_ms": round(book_age_ms, 1),
+            "book_depth_enough": int(bool(book_depth_enough)),
         }
         self._append_row(self._signal_path, row, SIGNAL_FIELDS)
 
@@ -271,6 +293,15 @@ class Tracker:
         signal_ready: bool = False,
         extreme_book: bool = False,
         book_state: str = "",
+        momentum_15s_pct: float = 0.0,
+        momentum_30s_pct: float = 0.0,
+        entry_spread: float = 0.0,
+        book_imbalance: float = 0.0,
+        time_bucket: str = "",
+        delta_bucket: str = "",
+        prob_bucket: str = "",
+        price_bucket: str = "",
+        edge_bucket: str = "",
     ):
         markov_stats = markov_stats or {}
         btc_delta_pct = ((adjusted_btc_price - opening_price) / opening_price * 100) if opening_price > 0 else 0.0
@@ -306,6 +337,15 @@ class Tracker:
             "basis_bps": round(getattr(source_decision, "basis_bps", 0.0) or 0.0, 4),
             "basis_mean_bps": round(getattr(source_decision, "basis_mean_bps", 0.0) or 0.0, 4),
             "basis_deviation_bps": round(getattr(source_decision, "basis_deviation_bps", 0.0) or 0.0, 4),
+            "momentum_15s_pct": round(momentum_15s_pct, 4),
+            "momentum_30s_pct": round(momentum_30s_pct, 4),
+            "entry_spread": round(entry_spread, 4),
+            "book_imbalance": round(book_imbalance, 4),
+            "time_bucket": time_bucket,
+            "delta_bucket": delta_bucket,
+            "prob_bucket": prob_bucket,
+            "price_bucket": price_bucket,
+            "edge_bucket": edge_bucket,
             "gate_reason": gate_reason,
             "signal_ready": int(bool(signal_ready)),
             "extreme_book": int(bool(extreme_book)),
@@ -398,7 +438,7 @@ class Tracker:
         won: bool,
         profit: float,
         exit_revenue: float = 0.0,
-        resolution_method: str = "binance_fallback",
+        resolution_method: str = "unresolved",
         claim_result: str = "not_attempted",
     ):
         if not self._current_trade:
@@ -406,8 +446,6 @@ class Tracker:
 
         entry_cost = self._current_trade.get("entry_cost", 0)
         entry_shares = self._current_trade.get("entry_shares", 0)
-        entry_price = self._current_trade.get("entry_price", 0)
-        side = self._current_trade.get("side", "")
 
         btc_delta = ((btc_final_price - opening_price) / opening_price * 100) if opening_price > 0 else 0
         resolution_payout = entry_shares * 1.0 if won else 0.0
