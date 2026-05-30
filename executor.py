@@ -1,19 +1,13 @@
-"""Order executor for Polymarket CLOB.
+"""Polymarket CLOB order execution.
 
-All orders route through the complement engine (tight spreads, real volume).
-Buys use create_order(OrderArgs) with integer shares and 2-decimal prices to
-avoid the float precision bug that create_market_order triggers internally
-(amount/price division produces 21.000000000004 shares, rejected by CLOB).
-Sells use create_market_order — the sell path doesn't have the same issue.
-
-Fill verification uses collateral balance change as the source of truth.
-Ghost fills (order went through despite API exception) are caught via
-balance snapshot before/after. Unverified buys are never cancelled —
-the bot detects them via balance sync at the next window boundary.
+Live entries use marketable FAK BUY limit orders with integer share size. This
+keeps taker execution while avoiding the py-clob-client-v2 BUY market helper's
+amount/price float division path.
 """
 
 import time
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Optional
 
 from py_clob_client_v2.client import ClobClient
@@ -35,8 +29,8 @@ FAILED = "FAILED"
 
 MIN_SHARES = 1.0
 MIN_AMOUNT_USD = 1.0
-MAX_BUY_PRICE = 0.90  # Allow high-conviction buys — profit comes from resolution at $1.00
-POLY_MIN_NOTIONAL = 5.0  # Backward-compatible name; CLOB mos=5 means shares, not fixed $5 notional
+MAX_BUY_PRICE = 0.90
+POLY_MIN_NOTIONAL = 5.0
 
 
 @dataclass
@@ -57,18 +51,29 @@ class OrderResult:
     price: float = 0.0
     amount_usd: float = 0.0
     shares: float = 0.0
-    shares_remaining: float = 0.0  # For partial fills
+    shares_remaining: float = 0.0
     token_id: str = ""
     error: str = ""
     dry_run: bool = True
 
 
+def _decimal_from_float(value: float | int | str) -> Decimal:
+    """Convert numeric inputs through str() so 0.59 stays Decimal('0.59')."""
+    return Decimal(str(value))
+
+
 def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
-    """Integer shares × price = clean 2-decimal USD amount."""
+    """Return integer shares and exact 2-decimal collateral spend."""
     if price <= 0 or max_usd <= 0:
         return 0.0, 0.0
-    price_cents = round(price * 100)
-    max_usd_cents = int(max_usd * 100)
+
+    price_dec = _decimal_from_float(price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    max_usd_dec = _decimal_from_float(max_usd).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if price_dec <= 0 or max_usd_dec <= 0:
+        return 0.0, 0.0
+
+    price_cents = int(price_dec * 100)
+    max_usd_cents = int(max_usd_dec * 100)
     max_shares = max_usd_cents // price_cents if price_cents > 0 else 0
 
     if max_shares < MIN_SHARES:
@@ -79,10 +84,23 @@ def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
             return 0.0, 0.0
 
     shares = int(max_shares)
-    spend = shares * price_cents / 100.0
-    if shares < MIN_SHARES:
+    spend_dec = (Decimal(shares) * price_dec).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if shares < MIN_SHARES or spend_dec <= 0:
         return 0.0, 0.0
-    return float(shares), spend
+    return float(shares), float(spend_dec)
+
+
+def _is_fak_no_fill_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "status_code=400" in text
+        and "fak" in text
+        and (
+            "no orders found to match" in text
+            or "no match" in text
+            or "no matching orders" in text
+        )
+    )
 
 
 class Executor:
@@ -128,10 +146,6 @@ class Executor:
             print(f"[executor] Collateral balance check failed: {sanitize_exception_text(e)}")
             return 0.0
 
-    def get_balance(self) -> float:
-        """Backward-compatible alias. Prefer get_collateral_balance()."""
-        return self.get_collateral_balance()
-
     def get_market_metadata(self, condition_id: str) -> MarketMetadata:
         """Fetch and cache CLOB market metadata: mos, mts, and platform fee rate.
 
@@ -167,17 +181,20 @@ class Executor:
                 fee_rate_bps=self.fee_rate_bps,
             )
 
-    # ── Price from complement engine ────────────────────────────────
-
     def _round_price_to_tick(self, price: float) -> float:
-        tick = float(self.tick_size or 0.01)
+        tick = _decimal_from_float(self.tick_size or 0.01)
         if tick <= 0:
-            tick = 0.01
-        rounded = round(round(float(price) / tick) * tick, 6)
-        return max(tick, min(1.0 - tick, rounded))
+            tick = Decimal("0.01")
+        price_dec = _decimal_from_float(price)
+        ticks = (price_dec / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        rounded = (ticks * tick).quantize(tick, rounding=ROUND_HALF_UP)
+        min_price = tick
+        max_price = Decimal("1") - tick
+        bounded = max(min_price, min(max_price, rounded))
+        return float(bounded)
 
     def get_market_price(self, token_id: str, side: str, amount_usd: float) -> float:
-        if not self._initialized:
+        if not self._initialized or not self.client:
             return 0.0
         try:
             price = self.client.calculate_market_price(
@@ -189,14 +206,13 @@ class Executor:
             return float(price) if price else 0.0
         except Exception as e:
             err = str(e).lower()
-            # Only log genuinely unexpected errors, not "no match" book-empty noise
             if "no match" not in err and "none" not in err:
                 print(f"[executor] Price check failed: {sanitize_exception_text(e)}")
             return 0.0
 
     def get_fee_rate_bps(self, token_id: str) -> float:
         """Return CLOB v2 fee rate in basis points for token metadata."""
-        if not self._initialized or not token_id:
+        if not self._initialized or not self.client or not token_id:
             return 0.0
         try:
             return float(self.client.get_fee_rate_bps(token_id))
@@ -204,17 +220,11 @@ class Executor:
             print(f"[executor] Fee metadata check failed: {sanitize_exception_text(e)}")
             return 0.0
 
-    # ── Buy (market order via complement engine) ─────────────────────
-
     def buy(self, token_id: str, amount_usd: float, price: float = 0.0) -> OrderResult:
-        """Buy via create_order + OrderArgs (limit order, complement engine).
+        """Buy with a marketable FAK limit order and explicit worst-price cap.
 
-        Uses explicit integer shares and 2-decimal price to avoid
-        float precision errors that create_market_order produces
-        internally (amount/price division → 21.000000000004 shares).
-
-        If price > 0, skips the internal get_market_price fetch (caller already
-        has a fresh price, saves one Tor roundtrip at execution time).
+        This avoids BUY MarketOrderArgsV2(amount=USD), whose internal
+        amount/price division can produce invalid share precision.
         """
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
@@ -232,7 +242,7 @@ class Executor:
                 token_id=token_id[:16] + "...", dry_run=True,
             )
 
-        if not self._initialized:
+        if not self._initialized or not self.client:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
 
         if price > 0:
@@ -251,18 +261,12 @@ class Executor:
         if market_price > MAX_BUY_PRICE:
             return OrderResult(
                 success=False, status=REJECTED,
-                error=f"Price ${market_price:.3f} > cap ${MAX_BUY_PRICE:.2f} "
-                      f"(TP impossible above this)",
+                error=f"Price ${market_price:.3f} > cap ${MAX_BUY_PRICE:.2f}",
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-        # Compute clean amounts with integer-cents math to avoid any
-        # floating-point precision that can trip Polymarket's
-        # "maker/taker accuracy" validation.
-        # - maker (shares): ≤ 4 decimals (we use integers)
-        # - taker (collateral):  ≤ 2 decimals (we use integer cents)
-        shares, clean_amount = calculate_order_size(market_price, amount_usd)
-        if shares < 1 or clean_amount <= 0:
+        shares, planned_spend = calculate_order_size(market_price, amount_usd)
+        if shares < 1 or planned_spend <= 0:
             return OrderResult(
                 success=False, status=REJECTED,
                 error=f"Can't afford 1 share at ${market_price:.3f} "
@@ -270,9 +274,6 @@ class Executor:
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
             )
 
-        # CLOB minimum_order_size is order size (shares) for limit orders.
-        # The dollar spend may be below $5 when price < $1; do not reject a
-        # valid GTC/GTD limit order just because shares × price is < mos.
         if shares < self.min_order_size:
             return OrderResult(
                 success=False, status=REJECTED,
@@ -281,25 +282,21 @@ class Executor:
             )
 
         print(f"  📊 Market price: ${market_price:.3f}/share "
-              f"→ {int(shares)} shares for ${clean_amount:.2f}")
+              f"→ {int(shares)} shares for ${planned_spend:.2f}")
 
-        # Snapshot balance BEFORE buy
-        balance_before = self.get_balance()
+        balance_before = self.get_collateral_balance()
 
         try:
-            # Use create_order + OrderArgs with explicit price/size.
-            # NOT create_market_order — that internally divides
-            # amount/price producing 21.000000000004 shares, which
-            # the CLOB rejects as "invalid amounts, max accuracy 4 decimals".
+            clob_order_type = OrderType.FAK
             order_args = OrderArgsV2(
                 token_id=token_id,
-                price=market_price,       # Already rounded to 2 decimals
-                size=float(int(shares)),  # Integer shares as float
+                price=market_price,
+                size=float(int(shares)),
                 side="BUY",
                 user_usdc_balance=balance_before,
             )
             signed_order = self.client.create_order(order_args)
-            result = self.client.post_order(signed_order, OrderType.GTC)
+            result = self.client.post_order(signed_order, clob_order_type, False)
 
             order_id = result.get("orderID", "")
             if not order_id:
@@ -309,17 +306,27 @@ class Executor:
                     token_id=token_id[:16] + "...",
                 )
 
-            # Limit orders route through complement engine in 5-15s.
-            # Wait for balance to settle, then verify.
             time.sleep(5)
             return self._verify_buy_via_balance(
                 order_id, market_price, float(shares), token_id, balance_before,
             )
 
         except Exception as e:
-            # Ghost fill defense: order may have gone through despite exception
+            if _is_fak_no_fill_error(e):
+                return OrderResult(
+                    success=False,
+                    status=REJECTED,
+                    error="fak_no_fill_liquidity_gone",
+                    side="BUY",
+                    price=market_price,
+                    amount_usd=planned_spend,
+                    shares=shares,
+                    token_id=token_id[:16] + "...",
+                    dry_run=False,
+                )
+
             time.sleep(3)
-            balance_after = self.get_balance()
+            balance_after = self.get_collateral_balance()
             spent = balance_before - balance_after if balance_before > 0 else 0
 
             if spent > 1.0:
@@ -341,15 +348,9 @@ class Executor:
         self, order_id: str, price: float, shares: float,
         token_id: str, balance_before: float,
     ) -> OrderResult:
-        """Verify buy fill. Tries 3 rounds of balance + order API checks.
-
-        CRITICAL: never cancels on timeout — Polygon settlement can take 5-15s.
-        If we can't verify, we return the order details so the bot can
-        retroactively detect the fill via balance sync at window boundary.
-        """
+        """Verify buy fill without cancelling unresolved FAK orders."""
         for attempt in range(3):
-            # Check balance (source of truth once chain settles)
-            balance_after = self.get_balance()
+            balance_after = self.get_collateral_balance()
             spent = balance_before - balance_after if balance_before > 0 else 0
 
             if spent > 0.50:
@@ -364,7 +365,6 @@ class Executor:
                     token_id=token_id[:16] + "...", dry_run=False,
                 )
 
-            # Check order API (updates faster than chain balance)
             fill = self._check_order(order_id)
             if fill:
                 matched = self._extract_fill(fill, price)
@@ -380,29 +380,19 @@ class Executor:
                     )
 
             if attempt < 2:
-                time.sleep(3)  # Wait 3s between attempts
+                time.sleep(3)
 
-        # After 3 rounds (~11s since order): still can't verify.
-        # DO NOT CANCEL — the order likely filled but chain hasn't settled.
-        # Return details so bot can detect it via balance sync.
         print(f"  ⏳ Buy unverified after {3*3+5}s — NOT cancelling "
               f"(Polygon may still be settling)")
         return OrderResult(
             success=False, order_id=order_id, status=FAILED,
-            error="UNVERIFIED_BUY",  # Special marker for bot to handle
+            error="UNVERIFIED_BUY",
             side="BUY", price=price, amount_usd=shares * price,
             shares=shares, token_id=token_id[:16] + "...",
         )
 
-    # ── Sell (balance-verified, partial fill aware) ─────────────────
-
     def sell(self, token_id: str, shares: float, price: float = 0.0) -> OrderResult:
-        """Sell shares via create_market_order.
-
-        Verifies the sell via collateral balance change, not order status.
-        Returns shares_remaining for partial fill tracking.
-        Rejects if share size is below CLOB minimum_order_size (usually 5 shares) — caller should hold to resolution.
-        """
+        """Sell shares and verify via collateral balance change."""
         sell_shares = int(shares)
         if sell_shares < 1:
             return OrderResult(
@@ -421,7 +411,7 @@ class Executor:
                 token_id=token_id[:16] + "...", dry_run=True,
             )
 
-        if not self._initialized:
+        if not self._initialized or not self.client:
             return OrderResult(success=False, status=FAILED, error="Not initialized")
 
         if price <= 0:
@@ -434,8 +424,6 @@ class Executor:
                     token_id=token_id[:16] + "...",
                 )
 
-        # Check minimum order size BEFORE attempting. For GTC/GTD CLOB orders,
-        # `min_order_size` is size in shares, not dollar notional.
         if sell_shares < self.min_order_size:
             return OrderResult(
                 success=False, status=REJECTED,
@@ -447,11 +435,9 @@ class Executor:
             )
 
         sell_amount = round(sell_shares * price, 2)
-
         print(f"  📊 Sell: {sell_shares} shares @ ${price:.3f} = ${sell_amount:.2f}")
 
-        # Snapshot balance BEFORE sell
-        balance_before = self.get_balance()
+        balance_before = self.get_collateral_balance()
 
         try:
             order_args = MarketOrderArgsV2(
@@ -467,23 +453,17 @@ class Executor:
             result = self.client.post_order(signed_order, OrderType.GTC)
             order_id = result.get("orderID", "")
 
-            # Wait for settlement
             time.sleep(2)
-
-            # Verify via balance change (the source of truth)
-            balance_after = self.get_balance()
+            balance_after = self.get_collateral_balance()
             received = balance_after - balance_before
 
-            if received > 0.10:  # Got collateral back
-                # Estimate shares sold from received amount
+            if received > 0.10:
                 shares_sold = received / price if price > 0 else 0
                 shares_left = max(0, sell_shares - shares_sold)
-
                 status = FILLED if shares_left < 1 else PARTIAL
                 if status == PARTIAL:
                     print(f"  ⚠️  Partial fill: sold ~{shares_sold:.0f} of {sell_shares}, "
                           f"~{shares_left:.0f} remaining")
-
                 return OrderResult(
                     success=True, order_id=order_id or "balance-verified",
                     status=status, side="SELL", price=price,
@@ -492,7 +472,6 @@ class Executor:
                     token_id=token_id[:16] + "...", dry_run=False,
                 )
 
-            # No balance change — check order status as fallback
             if order_id:
                 fill = self._check_order(order_id)
                 if fill:
@@ -505,10 +484,8 @@ class Executor:
                             shares_remaining=max(0, sell_shares - matched[2]),
                             token_id=token_id[:16] + "...", dry_run=False,
                         )
-
-            # Nothing worked
-            if order_id:
                 self.cancel_order(order_id)
+
             return OrderResult(
                 success=False, order_id=order_id or "", status=FAILED,
                 error="Sell not verified (no balance change)",
@@ -516,9 +493,8 @@ class Executor:
             )
 
         except Exception as e:
-            # Even on exception, check if balance changed (ghost sell)
             time.sleep(1)
-            balance_after = self.get_balance()
+            balance_after = self.get_collateral_balance()
             received = balance_after - balance_before
             if received > 0.10:
                 shares_sold = received / price if price > 0 else 0
@@ -538,7 +514,6 @@ class Executor:
                 side="SELL", price=price, token_id=token_id[:16] + "...",
             )
 
-    # ── Helpers ──────────────────────────────────────────────────────
 
     def _extract_fill(self, fill: dict, fallback_price: float) -> Optional[tuple]:
         size_matched = float(
@@ -554,7 +529,7 @@ class Executor:
         return (fill_price, size_matched * fill_price, size_matched)
 
     def _check_order(self, order_id: str) -> Optional[dict]:
-        if not self._initialized:
+        if not self._initialized or not self.client:
             return None
         try:
             return self.client.get_order(order_id)
@@ -563,7 +538,7 @@ class Executor:
             return None
 
     def cancel_order(self, order_id: str) -> bool:
-        if self.dry_run or not self._initialized:
+        if self.dry_run or not self._initialized or not self.client:
             return True
         try:
             self.client.cancel_orders([order_id])
@@ -573,7 +548,7 @@ class Executor:
             return False
 
     def cancel_all(self) -> bool:
-        if self.dry_run or not self._initialized:
+        if self.dry_run or not self._initialized or not self.client:
             return True
         try:
             self.client.cancel_all()

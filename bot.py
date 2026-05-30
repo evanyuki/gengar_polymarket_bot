@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PolyBot v13 — Recalibrated + Safety Systems
+PolyBot v14 — Huge-edge FAK Taker + Hold-to-resolution
 
 Strategy:
   - Brownian motion model with vol=0.12 (recalibrated from 0.08)
@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-from market import get_current_market, current_window_ts, PERIOD_SECONDS
+from market import get_current_market, PERIOD_SECONDS
 from price_feed import BinancePriceFeed
 from source_consensus import (
     PolymarketReferenceFeed,
@@ -53,16 +53,33 @@ from strategy import (
 )
 from markov import MarkovPersistenceFilter
 from security import sanitize_exception_text
-from executor import Executor, FILLED, PARTIAL, FAILED, MAX_BUY_PRICE, POLY_MIN_NOTIONAL
+from executor import Executor, MAX_BUY_PRICE, POLY_MIN_NOTIONAL, calculate_order_size
 from telegram_notifier import TelegramNotifier
 from tracker import Tracker
+from clob_orderbook_cache import ClobOrderBookCache
 
 
-FORCED_EXIT_START = 5
-FORCED_EXIT_END = 1
 POSITION_CHECK_INTERVAL = 3
-MAX_EXIT_RETRIES = 3
-EXIT_RETRY_COOLDOWN = 10
+
+
+def choose_fak_price_cap(
+    *,
+    true_prob: float,
+    executable_price: float,
+    fee_rate_bps: float,
+    required_fee_edge: float,
+    tick_size: float = 0.01,
+    slippage_ticks: int = 1,
+) -> float:
+    """Return the highest FAK cap whose fee-adjusted edge still clears policy."""
+    if executable_price <= 0:
+        return 0.0
+    tick = tick_size if tick_size > 0 else 0.01
+    base = round(round(executable_price / tick) * tick, 6)
+    cap = min(MAX_BUY_PRICE, 1.0 - tick, round(base + max(0, slippage_ticks) * tick, 6))
+    if fee_adjusted_edge(true_prob, cap, fee_rate_bps) >= required_fee_edge:
+        return cap
+    return base
 
 
 def compute_resolution_bankroll(bankroll_before_resolution: float, total_received: float) -> float:
@@ -73,6 +90,70 @@ def compute_resolution_bankroll(bankroll_before_resolution: float, total_receive
     payout, or zero for a loss). P&L stats are recorded separately.
     """
     return round(float(bankroll_before_resolution) + float(total_received), 2)
+
+
+def probability_for_held_side(
+    btc_delta_pct: float,
+    seconds_remaining: float,
+    held_side: str,
+    vol: float = 0.12,
+) -> float:
+    """Return Brownian probability for the side we actually hold.
+
+    estimate_true_probability() uses abs(delta), so its return value is the
+    probability that the current direction persists. It is not an unconditional
+    UP probability. A negative delta means the helper is already estimating the
+    DOWN probability.
+    """
+    direction_prob = estimate_true_probability(btc_delta_pct, seconds_remaining, vol=vol)
+    current_side = "UP" if btc_delta_pct >= 0 else "DOWN"
+    return direction_prob if current_side == held_side.upper() else 1.0 - direction_prob
+
+
+def calibration_bucket(value: float, cuts: list[float], labels: list[str]) -> str:
+    for cut, label in zip(cuts, labels):
+        if value < cut:
+            return label
+    return labels[-1]
+
+
+def calibration_buckets(
+    *,
+    seconds_remaining: float,
+    abs_delta_pct: float,
+    true_prob: float,
+    market_price: float,
+    fee_adjusted_edge_value: float,
+) -> dict:
+    """Compact forward-test buckets for calibration analysis."""
+    return {
+        "time_bucket": (
+            "T>180" if seconds_remaining > 180 else
+            "T120-180" if seconds_remaining > 120 else
+            "T60-120" if seconds_remaining > 60 else
+            "T<60"
+        ),
+        "delta_bucket": calibration_bucket(
+            abs_delta_pct,
+            [0.06, 0.10, 0.15, 0.25],
+            ["d<0.06", "d0.06-0.10", "d0.10-0.15", "d0.15-0.25", "d>=0.25"],
+        ),
+        "prob_bucket": calibration_bucket(
+            true_prob,
+            [0.80, 0.85, 0.90, 0.95],
+            ["p<0.80", "p0.80-0.85", "p0.85-0.90", "p0.90-0.95", "p>=0.95"],
+        ),
+        "price_bucket": calibration_bucket(
+            market_price,
+            [0.55, 0.65, 0.75, 0.85],
+            ["q<0.55", "q0.55-0.65", "q0.65-0.75", "q0.75-0.85", "q>=0.85"],
+        ),
+        "edge_bucket": calibration_bucket(
+            fee_adjusted_edge_value,
+            [0.05, 0.10, 0.15, 0.20, 0.30],
+            ["e<0.05", "e0.05-0.10", "e0.10-0.15", "e0.15-0.20", "e0.20-0.30", "e>=0.30"],
+        ),
+    }
 
 
 class PolyBot:
@@ -122,9 +203,8 @@ class PolyBot:
         self._open_price_initial_delay: float = float(os.getenv("OPEN_PRICE_INITIAL_DELAY_SECONDS", "6"))
         self._open_price_wait_seconds: float = float(os.getenv("OPEN_PRICE_WAIT_SECONDS", "12"))
         self._open_price_retry_interval: float = float(os.getenv("OPEN_PRICE_RETRY_INTERVAL", "2"))
-        self._stop_loss_enabled: bool = os.getenv("STOP_LOSS_ENABLED", "true").lower() == "true"
-        self._stop_loss_pct: float = float(os.getenv("STOP_LOSS_PCT", "0.18"))
-        self._stop_prob_floor: float = float(os.getenv("STOP_PROB_FLOOR", "0.35"))
+        self._huge_edge_min: float = float(os.getenv("ENTRY_HUGE_EDGE_MIN", "0.15"))
+        self._fak_slippage_ticks: int = int(os.getenv("ENTRY_FAK_SLIPPAGE_TICKS", "1"))
         self._entry_max_spread: float = float(os.getenv("ENTRY_MAX_SPREAD", "0.08"))
         self._entry_min_exit_price: float = float(os.getenv("ENTRY_MIN_EXIT_PRICE", "0.50"))
         self._source_consensus_config = SourceConsensusConfig(
@@ -133,7 +213,7 @@ class PolyBot:
                 "SOURCE_REQUIRE_LIVE_REFERENCE",
                 "true" if not self.dry_run else "false",
             ).lower() == "true",
-            default_basis_bps=float(os.getenv("SOURCE_DEFAULT_BASIS_BPS", "-17.3")),
+            default_basis_bps=float(os.getenv("SOURCE_DEFAULT_BASIS_BPS", "-14.6")),
             max_basis_deviation_bps=float(os.getenv("SOURCE_BASIS_SKIP_BPS", "8.0")),
             downsize_basis_deviation_bps=float(os.getenv("SOURCE_BASIS_DOWNSIZE_BPS", "5.0")),
             stale_downsize_seconds=float(os.getenv("SOURCE_STALE_DOWNSIZE_SEC", "10.0")),
@@ -143,6 +223,10 @@ class PolyBot:
             basis_window=int(os.getenv("SOURCE_BASIS_WINDOW", "24")),
         )
         self.source_consensus = SourceConsensusGate(self._source_consensus_config)
+        self._orderbook_cache_enabled: bool = os.getenv("CLOB_ORDERBOOK_CACHE_ENABLED", "true").lower() == "true"
+        self._orderbook_max_age: float = float(os.getenv("CLOB_ORDERBOOK_MAX_AGE_SEC", "1.0"))
+        self.orderbook_cache = ClobOrderBookCache(max_book_age_seconds=self._orderbook_max_age)
+        self._current_market = None
 
         self.price_feed = BinancePriceFeed()
         self.reference_feed = PolymarketReferenceFeed("BTC")
@@ -187,18 +271,13 @@ class PolyBot:
         self._entry_markov_threshold: float = self.strategy_config.markov_persistence_threshold
         self._entry_markov_passed: bool = False
 
-        # Exit state
-        self._exited: bool = False
+        # Resolution diagnostics
         self._exit_revenue: float = 0.0
-        self._exit_shares_sold: float = 0.0
-        self._residual_shares: float = 0.0  # Shares left after partial fill
         self._last_position_check: float = 0.0
         self._last_status_print: float = 0.0
         self._last_tick_context: dict = {}   # last entry-window state, for window-end signal logging
         self._session_start_time: float = time.time()
         self._recent_window_deltas: list = []  # rolling abs(close_delta_pct) per window
-        self._exit_retries: int = 0
-        self._exit_gave_up: bool = False
         self._last_sell_price_seen: float = 0.0  # last observed sell price during hold period
 
         # Pending phantom verification (claim sell reported success but balance didn't move yet)
@@ -236,13 +315,6 @@ class PolyBot:
 
     def start(self):
         if not self.dry_run:
-            live_confirm = os.getenv("LIVE_TRADING_CONFIRM", "")
-            required = "I_UNDERSTAND_REAL_FUNDS_ARE_AT_RISK"
-            if live_confirm != required:
-                print("\n🛡️  LIVE trading blocked.")
-                print("   DRY_RUN defaults to true. To trade real funds, set:")
-                print(f"   LIVE_TRADING_CONFIRM={required}")
-                return
             from proxy import ensure_tor, apply_proxy
             import logging as _log
             _log.basicConfig(level=_log.INFO, format="[%(name)s] %(message)s")
@@ -255,7 +327,7 @@ class PolyBot:
         mp = self.strategy_config.min_prob
         me = self.strategy_config.min_edge
         print("=" * 55)
-        print(f"  PolyBot v13 — Recalibrated (vol=0.12)")
+        print(f"  PolyBot v14 — Hold-to-resolution + huge-edge FAK taker")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
@@ -273,14 +345,18 @@ class PolyBot:
             f"skip dev>{self._source_consensus_config.max_basis_deviation_bps:.1f}bps | "
             f"stale skip>{self._source_consensus_config.stale_skip_seconds:.0f}s"
         )
+        print(
+            f"  CLOB price source: {'websocket cache' if self._orderbook_cache_enabled else 'REST'} "
+            f"| max age {self._orderbook_max_age:.1f}s"
+        )
+        print(
+            f"  Entry execution: FAK taker only | huge fee-edge ≥{self._huge_edge_min:.0%} "
+            f"| cap +{self._fak_slippage_ticks} tick if edge survives"
+        )
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
         print(f"  Vol: dynamic (fallback=0.12, floor={self._vol_floor}, cap={self._vol_cap}, windows={self._rolling_vol_windows})")
-        exit_label = (
-            f"stop-loss {self._stop_loss_pct:.0%} / prob<{self._stop_prob_floor:.0%}"
-            if self._stop_loss_enabled else "hold to resolution"
-        )
-        print(f"  Exits: {exit_label}")
+        print(f"  Exits: hold to resolution")
         print(f"  Daily loss limit: ${self._daily_loss_limit:.0f}")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
@@ -432,7 +508,7 @@ class PolyBot:
             print(f"  📌 Open: ${btc_price:,.2f}")
 
         # HOLDING: active position management
-        if self._traded and not self._exited and not self._exit_gave_up:
+        if self._traded:
             self._manage_position(btc_price, seconds_remaining, now)
             return
 
@@ -444,7 +520,7 @@ class PolyBot:
         # strategy is evaluated on a Binance price adjusted by the observed
         # Chainlink/Polymarket basis so we do not mix a Binance tick with a
         # Chainlink official open anchor.
-        reference_price = self._get_reference_price_for_window()
+        reference_price = self.reference_feed.get_latest()
         adjusted_btc_price = btc_price
         if self._source_consensus_config.enabled:
             adjusted_btc_price = btc_price * (1.0 + self.source_consensus.basis_mean_bps / 10000.0)
@@ -453,7 +529,7 @@ class PolyBot:
 
         realized_vol = self._compute_realized_vol()
         candidate_side = "UP" if adjusted_btc_price >= self._opening_price else "DOWN"
-        source_decision = self.source_consensus.assess(
+        source_decision = self.source_consensus.update_snapshot(
             binance_price=btc_price,
             opening_price=self._opening_price,
             intended_side=candidate_side,
@@ -512,6 +588,17 @@ class PolyBot:
             book_state = "complement_extreme"
         else:
             book_state = "normal"
+        momentum_15s = self._markov_filter.price_change_pct(15, now=now)
+        momentum_30s = self._markov_filter.price_change_pct(30, now=now)
+        entry_spread = abs((candidate_market_price + opposite_market_price) - 1.0)
+        book_imbalance = candidate_market_price - opposite_market_price
+        buckets = calibration_buckets(
+            seconds_remaining=seconds_remaining,
+            abs_delta_pct=abs(btc_delta_pct),
+            true_prob=candidate_true_prob,
+            market_price=candidate_market_price,
+            fee_adjusted_edge_value=net_edge,
+        )
         self.tracker.log_gate_tick(
             window_ts=self._current_window,
             btc_price=btc_price,
@@ -537,6 +624,11 @@ class PolyBot:
             signal_ready=bool(signal_result),
             extreme_book=book_state != "normal",
             book_state=book_state,
+            momentum_15s_pct=momentum_15s,
+            momentum_30s_pct=momentum_30s,
+            entry_spread=entry_spread,
+            book_imbalance=book_imbalance,
+            **buckets,
         )
 
         # Store context for window-end no-trade signal logging
@@ -618,12 +710,12 @@ class PolyBot:
             return
 
         btc_delta_pct = ((btc_price - self._opening_price) / self._opening_price) * 100
-        updated_prob = estimate_true_probability(btc_delta_pct, seconds_remaining)
-
-        if self._trade_side == "DOWN":
-            our_prob = 1.0 - updated_prob
-        else:
-            our_prob = updated_prob
+        our_prob = probability_for_held_side(
+            btc_delta_pct,
+            seconds_remaining,
+            self._trade_side,
+            vol=self._compute_realized_vol(),
+        )
 
         # Throttled check
         if now - self._last_position_check < POSITION_CHECK_INTERVAL:
@@ -661,21 +753,8 @@ class PolyBot:
         unrealized_pnl = current_value - self._trade_cost
         return_pct = (current_sell_price - self._trade_price) / self._trade_price if self._trade_price > 0 else 0
 
-        if self._stop_loss_enabled and not self._exit_gave_up:
-            price_stop = self._trade_price * (1.0 - self._stop_loss_pct)
-            stop_reason = ""
-            if current_sell_price <= price_stop:
-                stop_reason = f"price-stop {return_pct:+.0%}"
-            elif our_prob <= self._stop_prob_floor:
-                stop_reason = f"prob-stop {our_prob:.2f}"
-
-            if stop_reason:
-                print(
-                    f"  🛑 STOP triggered ({stop_reason}) | "
-                    f"Sell ${current_sell_price:.3f} vs entry ${self._trade_price:.3f}"
-                )
-                self._exit_position(current_sell_price, seconds_remaining, stop_reason)
-                return
+        # Hold-to-resolution policy: no stop-loss/prob-stop exits here. Sell
+        # price is observed only for diagnostics and post-session calibration.
 
         # Status line (monitoring only — no exits)
         d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
@@ -687,77 +766,6 @@ class PolyBot:
             f"Sell: ${current_sell_price:.3f} | "
             f"PnL: ${unrealized_pnl:+.2f} ({return_pct:+.0%})"
         )
-
-    # ── Execute exit (balance-verified, partial fill aware) ─────────
-
-    def _exit_position(self, sell_price: float, seconds_remaining: float, reason: str):
-        if self.dry_run:
-            revenue = self._trade_shares * sell_price
-            self._exited = True
-            self._exit_revenue = revenue
-            self.stats.bankroll += revenue
-            profit = revenue - self._trade_cost
-            self.tracker.log_trade_exit(
-                exit_type=reason,
-                exit_price=sell_price,
-                exit_shares_sold=self._trade_shares,
-                exit_revenue=revenue,
-                residual_shares=0.0,
-            )
-            print(f"  💰 EXIT ({reason}, paper): {self._trade_shares:.0f} shares @ "
-                  f"${sell_price:.3f} = ${revenue:.2f} | Profit: ${profit:+.2f}")
-            return
-
-        result = self.executor.sell(
-            token_id=self._trade_token_id,
-            shares=self._trade_shares,
-            price=sell_price,
-        )
-
-        if result.success:
-            self._exit_revenue += result.amount_usd
-            self._exit_shares_sold += result.shares
-            self._residual_shares = result.shares_remaining
-            self.stats.bankroll += result.amount_usd
-            self.tracker.log_trade_exit(
-                exit_type=reason,
-                exit_price=result.price,
-                exit_shares_sold=result.shares,
-                exit_revenue=result.amount_usd,
-                residual_shares=result.shares_remaining,
-            )
-
-            if result.status == PARTIAL and result.shares_remaining >= 1:
-                # Partial fill: got some collateral back, still have shares
-                print(f"  💰 EXIT ({reason}, partial): ~{result.shares:.0f} shares @ "
-                      f"${result.price:.3f} = ${result.amount_usd:.2f} | "
-                      f"~{result.shares_remaining:.0f} shares remaining → holding to resolution")
-                # Update shares but keep original cost for clean P&L math
-                self._trade_shares = result.shares_remaining
-                # Mark exited — residual resolves at window close
-                self._exited = True
-            else:
-                # Full fill (or residual < 1 share)
-                self._exited = True
-                profit = self._exit_revenue - self._trade_cost
-                print(f"  💰 EXIT ({reason}): {result.shares:.0f} shares @ "
-                      f"${result.price:.3f} = ${result.amount_usd:.2f} | "
-                      f"Profit: ${profit:+.2f}")
-        elif "hold to resolution" in result.error:
-            # Below $5 minimum — can't sell, hold to resolution
-            notional = self._trade_shares * sell_price
-            print(f"  📌 Can't sell: ${notional:.2f} below $5 minimum — holding to resolution")
-            self._exit_gave_up = True  # Skip further exit attempts
-        else:
-            self._exit_retries += 1
-            if self._exit_retries >= MAX_EXIT_RETRIES:
-                print(f"  ❌ Exit failed {MAX_EXIT_RETRIES} times ({reason}) — "
-                      f"holding to resolution")
-                self._exit_gave_up = True
-            else:
-                print(f"  ⚠️  Exit failed ({reason}, attempt "
-                      f"{self._exit_retries}/{MAX_EXIT_RETRIES}): {result.error}")
-                self._last_position_check = time.time() + EXIT_RETRY_COOLDOWN - POSITION_CHECK_INTERVAL
 
     # ── Window management ───────────────────────────────────────────
 
@@ -902,16 +910,13 @@ class PolyBot:
         self._opening_price = 0.0
         self._traded = False
         self._trade_attempted = False
-        self._exited = False
         self._exit_revenue = 0.0
-        self._exit_shares_sold = 0.0
-        self._residual_shares = 0.0
         self._last_position_check = 0.0
-        self._exit_retries = 0
-        self._exit_gave_up = False
+        self._last_status_print = 0.0
         self._last_sell_price_seen = 0.0
         self._cached_up = 0.50
         self._cached_down = 0.50
+
         self._cached_up_fee_bps = 0.0
         self._cached_down_fee_bps = 0.0
         self._price_last_fetched = 0.0
@@ -931,6 +936,9 @@ class PolyBot:
         self._window_open_price_missing = False
 
         market = self._wait_for_official_open_price(window_ts)
+        self._current_market = market
+        if market:
+            self._refresh_market_metadata_and_orderbook(market)
         if market and market.opening_price:
             self._opening_price = market.opening_price
             print(f"  📌 Polymarket openPrice: ${self._opening_price:,.2f}")
@@ -995,6 +1003,25 @@ class PolyBot:
             time.sleep(wait)
 
     # ── Market prices (cached, complement engine) ───────────────────
+
+    def _refresh_market_metadata_and_orderbook(self, market) -> None:
+        if not market or self.dry_run or not self.executor._initialized:
+            return
+        try:
+            metadata = self.executor.get_market_metadata(market.condition_id)
+            self._market_min_order_size = metadata.minimum_order_size
+            self._market_tick_size = metadata.minimum_tick_size
+            self._cached_up_fee_bps = metadata.fee_rate_bps
+            self._cached_down_fee_bps = metadata.fee_rate_bps
+            if self._orderbook_cache_enabled:
+                self.orderbook_cache.subscribe([market.token_id_up, market.token_id_down])
+                self.orderbook_cache.start()
+                print(
+                    f"  📡 CLOB orderbook cache subscribed "
+                    f"(UP/DOWN, max_age={self._orderbook_max_age:.1f}s)"
+                )
+        except Exception as e:
+            print(f"[market] Metadata/orderbook setup failed: {sanitize_exception_text(e)}")
 
     def _compute_realized_vol(self) -> float:
         """Rolling std dev of recent window closing deltas.
@@ -1067,20 +1094,30 @@ class PolyBot:
             return up, round(1.0 - up, 3)
 
         now = time.time()
-        if now - self._price_last_fetched < self._PRICE_REFRESH:
-            return self._cached_up, self._cached_down
-
+        market = self._current_market
         try:
-            market = get_current_market(self.period, include_open_price=False)
+            if not market:
+                market = get_current_market(self.period, include_open_price=False)
+                self._current_market = market
+                if market:
+                    self._refresh_market_metadata_and_orderbook(market)
             if not market:
                 return self._cached_up, self._cached_down
 
-            metadata = self.executor.get_market_metadata(market.condition_id)
-            self._market_min_order_size = metadata.minimum_order_size
-            self._market_tick_size = metadata.minimum_tick_size
-            probe_amount = max(metadata.minimum_order_size * 0.50, 1.0)
-            up_price = self.executor.get_market_price(market.token_id_up, "BUY", probe_amount)
-            down_price = self.executor.get_market_price(market.token_id_down, "BUY", probe_amount)
+            probe_amount = max(self._market_min_order_size * 0.50, 1.0)
+            up_price = 0.0
+            down_price = 0.0
+            if self._orderbook_cache_enabled:
+                up_price = self.orderbook_cache.get_market_price(market.token_id_up, "BUY", probe_amount)
+                down_price = self.orderbook_cache.get_market_price(market.token_id_down, "BUY", probe_amount)
+
+            if up_price <= 0 or down_price <= 0:
+                # Fallback only for display/diagnostics when the websocket cache is
+                # cold. The trade hot path below will not block on this REST path.
+                if now - self._price_last_fetched < self._PRICE_REFRESH:
+                    return self._cached_up, self._cached_down
+                up_price = up_price or self.executor.get_market_price(market.token_id_up, "BUY", probe_amount)
+                down_price = down_price or self.executor.get_market_price(market.token_id_down, "BUY", probe_amount)
 
             if up_price <= 0 and down_price <= 0:
                 return self._cached_up, self._cached_down
@@ -1091,8 +1128,6 @@ class PolyBot:
 
             self._cached_up = up_price
             self._cached_down = down_price
-            self._cached_up_fee_bps = metadata.fee_rate_bps
-            self._cached_down_fee_bps = metadata.fee_rate_bps
             self._price_last_fetched = now
 
             return up_price, down_price
@@ -1140,7 +1175,15 @@ class PolyBot:
             self.telegram.status_update({"alert": msg})
             return
 
-        market = get_current_market(self.period) if not self.dry_run else None
+        market = self._current_market if not self.dry_run else None
+        if not market and not self.dry_run:
+            try:
+                market = get_current_market(self.period, include_open_price=False)
+            except TypeError:
+                market = get_current_market(self.period)
+            self._current_market = market
+            if market:
+                self._refresh_market_metadata_and_orderbook(market)
         token_id = ""
         if market:
             token_id = market.token_id_up if sig.side == "UP" else market.token_id_down
@@ -1155,52 +1198,161 @@ class PolyBot:
               f"p(j*,j*)={sig.markov_persistence:.2f} [{sig.markov_regime}] | BTC Δ={sig.btc_delta_pct:+.3f}%")
         print(f"     Kelly: ${trade_amount:.2f} | mkt ${sig.market_price:.3f} | fee {sig.fee_rate_bps:.1f}bps | T-{seconds_remaining:.0f}s")
 
-        latest_btc, latest_fresh = self.price_feed.get_price()
-        latest_reference = self._get_reference_price_for_window()
-        if latest_fresh and latest_btc > 0 and self._opening_price > 0:
-            source_decision = self.source_consensus.assess(
-                binance_price=latest_btc,
-                opening_price=self._opening_price,
-                intended_side=sig.side,
-                reference=latest_reference,
+        source_decision = self.source_consensus.assess_snapshot(sig.side)
+        if source_decision.reason == "source_snapshot_missing":
+            latest_btc, latest_fresh = self.price_feed.get_price()
+            latest_reference = self.reference_feed.get_latest()
+            if latest_fresh and latest_btc > 0 and self._opening_price > 0:
+                source_decision = self.source_consensus.update_snapshot(
+                    binance_price=latest_btc,
+                    opening_price=self._opening_price,
+                    intended_side=sig.side,
+                    reference=latest_reference,
+                )
+        if source_decision.should_skip:
+            print(
+                f"  ⚠️  Source snapshot disagreement before entry — skipping "
+                f"({source_decision.reason}; basis="
+                f"{source_decision.basis_bps if source_decision.basis_bps is not None else 0:+.1f}bps, "
+                f"median={source_decision.basis_mean_bps:+.1f}bps, "
+                f"ref_age={source_decision.reference_age_seconds if source_decision.reference_age_seconds is not None else -1:.1f}s)"
             )
-            if source_decision.should_skip:
+            self._log_source_skip(sig, seconds_remaining, source_decision, "skipped_source_disagreement")
+            return
+        if source_decision.action == "downsize":
+            old_amount = trade_amount
+            trade_amount = round(max(
+                self.strategy_config.min_bet,
+                trade_amount * source_decision.size_multiplier,
+            ), 2)
+            sig.kelly_size = trade_amount
+            print(
+                f"  ⚠️  Source risk downsize snapshot ({source_decision.reason}): "
+                f"${old_amount:.2f} → ${trade_amount:.2f}"
+            )
+
+        if self.dry_run:
+            required_fee_edge = max(sig.edge_required, self._huge_edge_min)
+            if sig.fee_adjusted_edge < required_fee_edge:
                 print(
-                    f"  ⚠️  Source disagreement before entry — skipping "
-                    f"({source_decision.reason}; basis="
-                    f"{source_decision.basis_bps if source_decision.basis_bps is not None else 0:+.1f}bps, "
-                    f"mean={source_decision.basis_mean_bps:+.1f}bps, "
-                    f"ref_age={source_decision.reference_age_seconds if source_decision.reference_age_seconds is not None else -1:.1f}s)"
+                    f"  ⚠️  Dry-run signal not huge enough for FAK policy — skipping "
+                    f"(fee-edge {sig.fee_adjusted_edge:.3f} < {required_fee_edge:.3f})"
                 )
-                self._log_source_skip(sig, seconds_remaining, source_decision, "skipped_source_disagreement")
+                self.tracker.log_signal(
+                    window_ts=self._current_window,
+                    btc_price=self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0,
+                    opening_price=self._opening_price,
+                    up_price=self._cached_up,
+                    down_price=self._cached_down,
+                    seconds_remaining=seconds_remaining,
+                    side=sig.side,
+                    true_prob=sig.true_prob,
+                    market_price=sig.market_price,
+                    edge=sig.edge,
+                    kelly_size=sig.kelly_size,
+                    markov_persistence=sig.markov_persistence,
+                    fee_rate_bps=sig.fee_rate_bps,
+                    fee_adjusted_edge=sig.fee_adjusted_edge,
+                    action="skipped_not_huge_edge",
+                    skip_reason="fee_adjusted_edge_below_huge_taker_threshold",
+                    actual_price=sig.market_price,
+                    actual_edge=sig.edge,
+                )
                 return
-            if source_decision.action == "downsize":
-                old_amount = trade_amount
-                trade_amount = round(max(
-                    self.strategy_config.min_bet,
-                    trade_amount * source_decision.size_multiplier,
-                ), 2)
-                sig.kelly_size = trade_amount
-                print(
-                    f"  ⚠️  Source risk downsize before entry ({source_decision.reason}): "
-                    f"${old_amount:.2f} → ${trade_amount:.2f}"
-                )
 
-        # Preview actual market price, re-check edge, then pass price into buy()
-        # so executor skips a second fetch (saves one Tor roundtrip ~500ms)
+        # Huge-edge-only execution: this strategy captures oracle/repricing lag.
+        # If the fee-adjusted edge is not large enough to justify immediate
+        # taker execution, skip. Post-only/GTD maker entry was removed because it
+        # conflicts with the latency edge and creates adverse-selection fills.
         hint_price = sig.market_price if self.dry_run else 0.0
+        depth_snapshot = None
         if not self.dry_run and self.executor._initialized:
-            actual_price = self.executor.get_market_price(token_id, "BUY", trade_amount)
-            if actual_price > 0:
-                actual_edge = sig.true_prob - actual_price
-                actual_fee_edge = fee_adjusted_edge(sig.true_prob, actual_price, sig.fee_rate_bps)
-                print(
-                    f"  📊 Actual price: ${actual_price:.3f} "
-                    f"(edge: {actual_edge:.3f}, fee-edge: {actual_fee_edge:.3f}, req: {sig.edge_required:.3f})"
+            actual_price = 0.0
+            if self._orderbook_cache_enabled:
+                actual_price = self.orderbook_cache.get_market_price(token_id, "BUY", trade_amount)
+            if actual_price <= 0:
+                actual_price = self.executor.get_market_price(token_id, "BUY", trade_amount)
+            if actual_price <= 0:
+                print("  ⚠️  No executable CLOB ask before FAK entry — skipping")
+                self.tracker.log_signal(
+                    window_ts=self._current_window,
+                    btc_price=self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0,
+                    opening_price=self._opening_price,
+                    up_price=self._cached_up,
+                    down_price=self._cached_down,
+                    seconds_remaining=seconds_remaining,
+                    side=sig.side,
+                    true_prob=sig.true_prob,
+                    market_price=sig.market_price,
+                    edge=sig.edge,
+                    kelly_size=sig.kelly_size,
+                    markov_persistence=sig.markov_persistence,
+                    fee_rate_bps=sig.fee_rate_bps,
+                    fee_adjusted_edge=sig.fee_adjusted_edge,
+                    action="skipped_orderbook_stale",
+                    skip_reason="clob_fak_price_unavailable",
+                    actual_price=0.0,
+                    actual_edge=0.0,
                 )
+                return
 
-                if actual_fee_edge < sig.edge_required:
-                    print(f"  ⚠️  Edge gone at market price — skipping")
+            actual_edge = sig.true_prob - actual_price
+            required_fee_edge = max(sig.edge_required, self._huge_edge_min)
+            price_cap = choose_fak_price_cap(
+                true_prob=sig.true_prob,
+                executable_price=actual_price,
+                fee_rate_bps=sig.fee_rate_bps,
+                required_fee_edge=required_fee_edge,
+                tick_size=self._market_tick_size,
+                slippage_ticks=self._fak_slippage_ticks,
+            )
+            actual_fee_edge = fee_adjusted_edge(sig.true_prob, price_cap, sig.fee_rate_bps)
+            print(
+                f"  📊 FAK ask: ${actual_price:.3f} | cap ${price_cap:.3f} "
+                f"(edge@cap: {sig.true_prob - price_cap:.3f}, fee-edge@cap: {actual_fee_edge:.3f}, "
+                f"threshold: {required_fee_edge:.3f})"
+            )
+            if actual_fee_edge < required_fee_edge:
+                print("  ⚠️  Edge is not huge enough for taker execution — skipping")
+                btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
+                self.tracker.log_signal(
+                    window_ts=self._current_window,
+                    btc_price=btc_approx,
+                    opening_price=self._opening_price,
+                    up_price=self._cached_up,
+                    down_price=self._cached_down,
+                    seconds_remaining=seconds_remaining,
+                    side=sig.side,
+                    true_prob=sig.true_prob,
+                    market_price=actual_price,
+                    edge=actual_edge,
+                    kelly_size=sig.kelly_size,
+                    markov_persistence=sig.markov_persistence,
+                    fee_rate_bps=sig.fee_rate_bps,
+                    fee_adjusted_edge=actual_fee_edge,
+                    action="skipped_not_huge_edge",
+                    skip_reason="fee_adjusted_edge_below_huge_taker_threshold",
+                    actual_price=actual_price,
+                    actual_edge=actual_edge,
+                )
+                return
+
+            # Ensure budget buys at least the market's minimum share size.
+            min_live_amount = round(float(self._market_min_order_size) * price_cap, 2)
+            if trade_amount < min_live_amount:
+                if min_live_amount <= self.strategy_config.max_bet:
+                    print(
+                        f"  ℹ️  Raising FAK amount to CLOB minimum size: "
+                        f"${trade_amount:.2f} → ${min_live_amount:.2f} "
+                        f"({self._market_min_order_size:.0f} shares @ cap ${price_cap:.3f})"
+                    )
+                    trade_amount = min_live_amount
+                    sig.kelly_size = trade_amount
+                else:
+                    print(
+                        f"  ⚠️  CLOB minimum size too large — skipping "
+                        f"(${min_live_amount:.2f} required > max ${self.strategy_config.max_bet:.2f})"
+                    )
                     btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
                     self.tracker.log_signal(
                         window_ts=self._current_window,
@@ -1213,137 +1365,149 @@ class PolyBot:
                         true_prob=sig.true_prob,
                         market_price=actual_price,
                         edge=actual_edge,
-                        kelly_size=sig.kelly_size,
+                        kelly_size=trade_amount,
                         markov_persistence=sig.markov_persistence,
                         fee_rate_bps=sig.fee_rate_bps,
                         fee_adjusted_edge=actual_fee_edge,
-                        action="skipped_edge_gone",
-                        skip_reason="edge_gone_at_market",
+                        action="skipped_size_too_small",
+                        skip_reason="clob_min_size_exceeds_max_bet",
                         actual_price=actual_price,
                         actual_edge=actual_edge,
                     )
                     return
 
-                # CLOB GTC/GTD minimum is order size in shares, not fixed $5 notional.
-                # For BTC 5m markets mos is usually 5 shares, so minimum spend is
-                # mos × executable price. Bump to the smallest valid order only if
-                # it stays within the configured max_bet; otherwise skip explicitly.
-                min_live_amount = round(float(self._market_min_order_size) * actual_price, 2)
-                if trade_amount < min_live_amount:
-                    if min_live_amount <= self.strategy_config.max_bet:
-                        print(
-                            f"  ℹ️  Raising order to CLOB minimum size: "
-                            f"${trade_amount:.2f} → ${min_live_amount:.2f} "
-                            f"({self._market_min_order_size:.0f} shares @ ${actual_price:.3f})"
-                        )
-                        trade_amount = min_live_amount
-                        sig.kelly_size = trade_amount
+            planned_shares, _planned_spend = calculate_order_size(price_cap, trade_amount)
+            if self._orderbook_cache_enabled and planned_shares > 0:
+                depth_snapshot = self.orderbook_cache.get_buy_depth_snapshot(
+                    token_id,
+                    required_shares=planned_shares,
+                    cap_price=price_cap,
+                )
+                print(
+                    f"  📚 Ask depth≤cap: {depth_snapshot.cumulative_shares:.0f}/"
+                    f"{planned_shares:.0f} shares | best ask ${depth_snapshot.best_ask:.3f} "
+                    f"| worst ${depth_snapshot.worst_price:.3f} | age {depth_snapshot.book_age_ms:.0f}ms"
+                )
+                if not depth_snapshot.enough:
+                    btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
+                    self.tracker.log_signal(
+                        window_ts=self._current_window,
+                        btc_price=btc_approx,
+                        opening_price=self._opening_price,
+                        up_price=self._cached_up,
+                        down_price=self._cached_down,
+                        seconds_remaining=seconds_remaining,
+                        side=sig.side,
+                        true_prob=sig.true_prob,
+                        market_price=price_cap,
+                        edge=sig.true_prob - price_cap,
+                        kelly_size=trade_amount,
+                        markov_persistence=sig.markov_persistence,
+                        fee_rate_bps=sig.fee_rate_bps,
+                        fee_adjusted_edge=actual_fee_edge,
+                        action="skipped_liquidity_gone",
+                        skip_reason="insufficient_depth_at_fak_cap",
+                        actual_price=price_cap,
+                        actual_edge=sig.true_prob - price_cap,
+                        book_best_bid=depth_snapshot.best_bid,
+                        book_best_ask=depth_snapshot.best_ask,
+                        book_worst_ask_at_cap=depth_snapshot.worst_price,
+                        book_cap_price=depth_snapshot.cap_price,
+                        book_depth_shares_at_cap=depth_snapshot.cumulative_shares,
+                        book_required_shares=depth_snapshot.required_shares,
+                        book_depth_usd_at_cap=depth_snapshot.cumulative_usd,
+                        book_age_ms=depth_snapshot.book_age_ms,
+                        book_depth_enough=depth_snapshot.enough,
+                    )
+                    print("  ⚠️  Liquidity gone before FAK entry — skipping")
+                    return
+
+            latest_btc, latest_fresh = self.price_feed.get_price()
+            if latest_fresh and self._opening_price > 0 and latest_btc > 0:
+                latest_adjusted_btc = latest_btc * (1.0 + self.source_consensus.basis_mean_bps / 10000.0)
+                latest_delta_pct = (latest_adjusted_btc - self._opening_price) / self._opening_price * 100
+                latest_side = "UP" if latest_adjusted_btc >= self._opening_price else "DOWN"
+                recheck_vol = self._compute_realized_vol()
+                latest_our_prob = probability_for_held_side(
+                    latest_delta_pct,
+                    seconds_remaining,
+                    sig.side,
+                    vol=recheck_vol,
+                )
+                if latest_side != sig.side or latest_our_prob < self.strategy_config.min_prob:
+                    if latest_side != sig.side:
+                        action = "skipped_btc_reversed"
+                        skip_reason = "btc_reversed_before_entry"
+                        message = "Basis-adjusted BTC reversed before entry"
                     else:
-                        print(
-                            f"  ⚠️  CLOB minimum size too large — skipping "
-                            f"(${min_live_amount:.2f} required > max ${self.strategy_config.max_bet:.2f})"
-                        )
-                        btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
-                        self.tracker.log_signal(
-                            window_ts=self._current_window,
-                            btc_price=btc_approx,
-                            opening_price=self._opening_price,
-                            up_price=self._cached_up,
-                            down_price=self._cached_down,
-                            seconds_remaining=seconds_remaining,
-                            side=sig.side,
-                            true_prob=sig.true_prob,
-                            market_price=actual_price,
-                            edge=actual_edge,
-                            kelly_size=trade_amount,
-                            markov_persistence=sig.markov_persistence,
-                            fee_rate_bps=sig.fee_rate_bps,
-                            fee_adjusted_edge=actual_fee_edge,
-                            action="skipped_size_too_small",
-                            skip_reason="clob_min_size_exceeds_max_bet",
-                            actual_price=actual_price,
-                            actual_edge=actual_edge,
-                        )
-                        return
+                        action = "skipped_prob_below_min"
+                        skip_reason = "prob_below_min_at_final_recheck"
+                        message = "Final recheck probability fell below min before entry"
+                    print(
+                        f"  ⚠️  {message} — skipping "
+                        f"(now {latest_side}, prob={latest_our_prob:.2f}, "
+                        f"min={self.strategy_config.min_prob:.2f}, vol={recheck_vol:.4f}, "
+                        f"Δ={latest_delta_pct:+.3f}%)"
+                    )
+                    self.tracker.log_signal(
+                        window_ts=self._current_window,
+                        btc_price=latest_adjusted_btc,
+                        opening_price=self._opening_price,
+                        up_price=self._cached_up,
+                        down_price=self._cached_down,
+                        seconds_remaining=seconds_remaining,
+                        side=sig.side,
+                        true_prob=latest_our_prob,
+                        market_price=price_cap,
+                        edge=latest_our_prob - price_cap,
+                        kelly_size=sig.kelly_size,
+                        markov_persistence=sig.markov_persistence,
+                        fee_rate_bps=sig.fee_rate_bps,
+                        fee_adjusted_edge=fee_adjusted_edge(latest_our_prob, price_cap, sig.fee_rate_bps),
+                        action=action,
+                        skip_reason=skip_reason,
+                        actual_price=price_cap,
+                        actual_edge=latest_our_prob - price_cap,
+                    )
+                    return
 
-                latest_btc, latest_fresh = self.price_feed.get_price()
-                if latest_fresh and self._opening_price > 0 and latest_btc > 0:
-                    latest_adjusted_btc = latest_btc * (1.0 + self.source_consensus.basis_mean_bps / 10000.0)
-                    latest_delta_pct = (latest_adjusted_btc - self._opening_price) / self._opening_price * 100
-                    latest_side = "UP" if latest_adjusted_btc >= self._opening_price else "DOWN"
-                    latest_up_prob = estimate_true_probability(latest_delta_pct, seconds_remaining)
-                    latest_our_prob = latest_up_prob if sig.side == "UP" else 1.0 - latest_up_prob
-                    if latest_side != sig.side or latest_our_prob < self.strategy_config.min_prob:
-                        print(
-                            f"  ⚠️  Basis-adjusted BTC reversed before entry — skipping "
-                            f"(now {latest_side}, prob={latest_our_prob:.2f}, Δ={latest_delta_pct:+.3f}%)"
-                        )
-                        self.tracker.log_signal(
-                            window_ts=self._current_window,
-                            btc_price=latest_adjusted_btc,
-                            opening_price=self._opening_price,
-                            up_price=self._cached_up,
-                            down_price=self._cached_down,
-                            seconds_remaining=seconds_remaining,
-                            side=sig.side,
-                            true_prob=latest_our_prob,
-                            market_price=actual_price,
-                            edge=latest_our_prob - actual_price,
-                            kelly_size=sig.kelly_size,
-                            markov_persistence=sig.markov_persistence,
-                            fee_rate_bps=sig.fee_rate_bps,
-                            fee_adjusted_edge=sig.fee_adjusted_edge,
-                            action="skipped_btc_reversed",
-                            skip_reason="btc_reversed_before_entry",
-                            actual_price=actual_price,
-                            actual_edge=latest_our_prob - actual_price,
-                        )
-                        return
+            exit_probe = max(trade_amount, self._market_min_order_size, 1.0)
+            current_sell_price = (
+                self.orderbook_cache.get_market_price(token_id, "SELL", exit_probe)
+                if self._orderbook_cache_enabled
+                else self.executor.get_market_price(token_id, "SELL", exit_probe)
+            )
+            if current_sell_price > 0:
+                spread = price_cap - current_sell_price
+                if spread > self._entry_max_spread or current_sell_price < self._entry_min_exit_price:
+                    print(
+                        f"  ⚠️  Reverse/thin orderbook — skipping "
+                        f"(buy cap ${price_cap:.3f}, sell ${current_sell_price:.3f}, spread {spread:.3f})"
+                    )
+                    btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
+                    self.tracker.log_signal(
+                        window_ts=self._current_window,
+                        btc_price=btc_approx,
+                        opening_price=self._opening_price,
+                        up_price=self._cached_up,
+                        down_price=self._cached_down,
+                        seconds_remaining=seconds_remaining,
+                        side=sig.side,
+                        true_prob=sig.true_prob,
+                        market_price=price_cap,
+                        edge=sig.true_prob - price_cap,
+                        kelly_size=sig.kelly_size,
+                        markov_persistence=sig.markov_persistence,
+                        fee_rate_bps=sig.fee_rate_bps,
+                        fee_adjusted_edge=actual_fee_edge,
+                        action="skipped_reverse_orderbook",
+                        skip_reason="reverse_orderbook_before_entry",
+                        actual_price=price_cap,
+                        actual_edge=sig.true_prob - price_cap,
+                    )
+                    return
 
-                # If the bid for the same token is already far below the ask we
-                # would pay, the orderbook has moved against us or liquidity is
-                # too thin. The last two LIVE losses showed this signature: the
-                # position's sell price collapsed to <= $0.43/$0.01 shortly after
-                # entry. Do not enter a trade that would immediately satisfy the
-                # configured stop-loss.
-                exit_probe = max(trade_amount, self._market_min_order_size, 1.0)
-                current_sell_price = self.executor.get_market_price(token_id, "SELL", exit_probe)
-                if current_sell_price > 0:
-                    spread = actual_price - current_sell_price
-                    stop_line = actual_price * (1.0 - self._stop_loss_pct)
-                    if (
-                        spread > self._entry_max_spread
-                        or current_sell_price < self._entry_min_exit_price
-                        or (self._stop_loss_enabled and current_sell_price <= stop_line)
-                    ):
-                        print(
-                            f"  ⚠️  Reverse/thin orderbook — skipping "
-                            f"(buy ${actual_price:.3f}, sell ${current_sell_price:.3f}, spread {spread:.3f})"
-                        )
-                        btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
-                        self.tracker.log_signal(
-                            window_ts=self._current_window,
-                            btc_price=btc_approx,
-                            opening_price=self._opening_price,
-                            up_price=self._cached_up,
-                            down_price=self._cached_down,
-                            seconds_remaining=seconds_remaining,
-                            side=sig.side,
-                            true_prob=sig.true_prob,
-                            market_price=actual_price,
-                            edge=actual_edge,
-                            kelly_size=sig.kelly_size,
-                            markov_persistence=sig.markov_persistence,
-                            fee_rate_bps=sig.fee_rate_bps,
-                            fee_adjusted_edge=sig.fee_adjusted_edge,
-                            action="skipped_reverse_orderbook",
-                            skip_reason="reverse_orderbook_before_entry",
-                            actual_price=actual_price,
-                            actual_edge=actual_edge,
-                        )
-                        return
-
-                hint_price = actual_price
+            hint_price = price_cap
 
         result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=hint_price)
 
@@ -1385,6 +1549,15 @@ class PolyBot:
                 actual_price=result.price,
                 actual_edge=sig.true_prob - result.price,
                 fill_price=result.price,
+                book_best_bid=depth_snapshot.best_bid if depth_snapshot else 0.0,
+                book_best_ask=depth_snapshot.best_ask if depth_snapshot else 0.0,
+                book_worst_ask_at_cap=depth_snapshot.worst_price if depth_snapshot else 0.0,
+                book_cap_price=depth_snapshot.cap_price if depth_snapshot else 0.0,
+                book_depth_shares_at_cap=depth_snapshot.cumulative_shares if depth_snapshot else 0.0,
+                book_required_shares=depth_snapshot.required_shares if depth_snapshot else 0.0,
+                book_depth_usd_at_cap=depth_snapshot.cumulative_usd if depth_snapshot else 0.0,
+                book_age_ms=depth_snapshot.book_age_ms if depth_snapshot else 0.0,
+                book_depth_enough=depth_snapshot.enough if depth_snapshot else False,
             )
             self.tracker.log_trade_entry(
                 window_ts=self._current_window,
@@ -1404,13 +1577,7 @@ class PolyBot:
             mode = "PAPER" if self.dry_run else "LIVE"
             print(f"  ✅ {mode}: {result.shares:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_usd:.2f}")
-            if self._stop_loss_enabled:
-                print(
-                    f"     Exit policy: stop-loss {self._stop_loss_pct:.0%} / "
-                    f"prob<{self._stop_prob_floor:.0%}; otherwise resolution"
-                )
-            else:
-                print(f"     Exit policy: hold to resolution (stops disabled)")
+            print(f"     Exit policy: hold to resolution")
 
             self.telegram.trade_alert(
                 side=sig.side, price=result.price, amount=result.amount_usd,
@@ -1443,35 +1610,9 @@ class PolyBot:
                         print(f"\n  {msg}")
                         self.telegram.status_update({"alert": msg})
 
-    # ── Resolve (partial fill aware) ────────────────────────────────
+    # ── Resolve hold-to-resolution trade ────────────────────────────
 
     def _resolve_previous_trade(self):
-        if self._exited:
-            profit = self._exit_revenue - self._trade_cost
-            if profit > 0:
-                self.stats.record_win(profit)
-            else:
-                self.stats.record_loss(abs(profit))
-            result_emoji = "✅ WIN" if profit > 0 else "❌ LOSS"
-            residual_note = f" (~{self._residual_shares:.0f} residual)" if self._residual_shares >= 1 else ""
-            print(f"  {result_emoji} (exited{residual_note}) ${profit:+.2f} | "
-                  f"P&L: ${self.stats.total_pnl:+.2f} | "
-                  f"Bank: ${self.stats.bankroll:.2f}")
-            if profit > 0:
-                self.telegram.win_alert(profit, self.stats.total_pnl)
-            else:
-                self.telegram.loss_alert(abs(profit), self.stats.total_pnl)
-            btc_price, _ = self.price_feed.get_price()
-            self.tracker.log_trade_resolve(
-                btc_final_price=btc_price,
-                opening_price=self._opening_price,
-                won=profit > 0,
-                profit=profit,
-                exit_revenue=self._exit_revenue,
-                resolution_method="exited",
-            )
-            return
-
         original_cost = self._trade_cost
         remaining_shares = self._trade_shares
 
@@ -1485,7 +1626,7 @@ class PolyBot:
                 won=won,
                 original_cost=original_cost,
                 remaining_shares=remaining_shares,
-                resolution_method="binance_fallback",
+                resolution_method="dry_binance_fallback",
                 claim_revenue=0.0,
             )
             return
@@ -1505,18 +1646,9 @@ class PolyBot:
                       and not self._trade_token_id.startswith("DRY-")
                       and self.executor._initialized)
 
-        # Short-circuit: if last observed sell price is below $0.50, market has
-        # already priced these shares as worthless — skip the claim API call.
-        if self._last_sell_price_seen > 0 and self._last_sell_price_seen < 0.50:
-            self._record_resolution(
-                won=False,
-                original_cost=original_cost,
-                remaining_shares=remaining_shares,
-                resolution_method="market_price",
-                claim_revenue=0.0,
-                claim_result="skipped_losing",
-            )
-            return
+        # Live resolution truth is claim/balance/official settlement evidence.
+        # Do not classify a live loss from transient market price alone; Binance
+        # and top-of-book prices are diagnostics, not final truth.
 
         pre_sell_balance = 0.0
         if live_token and claim_notional >= 5.0:
@@ -1582,15 +1714,11 @@ class PolyBot:
         # (~5 min), where Polygon settlement is guaranteed to have landed.
         if won is None:
             if not live_token:
-                # No valid token/executor — Binance price as last resort
-                btc_price, _ = self.price_feed.get_price()
-                if self._opening_price > 0 and btc_price > 0:
-                    won = (btc_price >= self._opening_price) == (self._trade_side == "UP")
-                    resolution_method = "binance_fallback"
-                    print(f"  ⚠️  No live token — using Binance fallback")
-                else:
-                    print(f"  ⚠️  Cannot determine resolution outcome — skipping")
-                    return
+                print(
+                    "  ⚠️  Cannot determine LIVE resolution without a live token/executor — "
+                    "leaving trade unresolved for CSV/balance reconciliation"
+                )
+                return
             else:
                 if pre_sell_balance <= 0:
                     pre_sell_balance = self.executor.get_collateral_balance()
@@ -1762,6 +1890,7 @@ class PolyBot:
             self.stats.hourly.reset()
 
     def _handle_shutdown(self, signum, frame):
+        _ = (signum, frame)
         print(f"\n\n🛑 Shutting down...")
         self._running = False
         self.price_feed.stop()
