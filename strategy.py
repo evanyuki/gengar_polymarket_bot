@@ -354,7 +354,6 @@ def get_skip_reason(
     btc_delta_pct = ((btc_price - opening_price) / opening_price) * 100
     if abs(btc_delta_pct) < config.min_btc_delta:
         return "delta_too_small"
-    side = "UP" if btc_delta_pct > 0 else "DOWN"
     market_price = up_market_price if btc_delta_pct > 0 else down_market_price
     if market_price > config.max_price or market_price < config.min_price:
         return "price_out_of_range"

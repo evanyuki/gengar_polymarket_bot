@@ -1,7 +1,6 @@
 """Telegram notification module with hourly summary reports."""
 
 import os
-import time
 import urllib.request
 import urllib.parse
 import json
