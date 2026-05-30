@@ -8,14 +8,14 @@ An algorithmic trading bot ("PolyBot") for Polymarket's 5-minute BTC Up/Down bin
 
 JLow (jlowplayground on Polymarket). Solo developer. Started from zero software development knowledge in January 2026, built this from scratch using Claude + Cursor. Treats this as a serious trading operation.
 
-## Current version: v13 — Recalibrated + Safety Systems
+## Current version: v14 — Huge-edge FAK taker + Hold-to-resolution
 
 ### Files
 
 ```
-bot.py              → Main loop, position lifecycle, circuit breakers (v13)
+bot.py              → Main loop, position lifecycle, circuit breakers (v14)
 strategy.py         → Brownian motion probability + Kelly criterion (recalibrated vol=0.12)
-executor.py         → Polymarket CLOB order execution (balance-verified, create_order path)
+executor.py         → Polymarket CLOB order execution (balance-verified FAK taker market-order path)
 market.py           → Market discovery via Gamma API
 price_feed.py       → Binance WebSocket for real-time BTC
 tracker.py          → Quant analytics logger (signals.csv, trades.csv, executions.csv)
@@ -57,19 +57,17 @@ Every 5 minutes, Polymarket opens a market: "Will BTC be higher or lower?" Share
    - Even if model is 15% wrong, we break even
    - Was 0.70 initially — too aggressive for 5-min markets, no trades fired. Raised to 0.85.
 
-### Position sizing
+### Position sizing and execution
 
-Quarter-Kelly criterion. `kelly_f = (b*p - q) / b` where `b = (1-price)/price`. Then `bet = bankroll × kelly_f × 0.25`. Bounded by configured `MIN_BET`/`MAX_BET`. For LIVE GTC/GTD limit orders, Polymarket's `minimum_order_size` is shares (BTC 5m commonly 5 shares), not a fixed $5 notional; the executable minimum spend is approximately `min_order_size × price`, with a separate $1 budget floor for the executor.
+Quarter-Kelly criterion. `kelly_f = (b*p - q) / b` where `b = (1-price)/price`. Then `bet = bankroll × kelly_f × 0.25`. Bounded by configured `MIN_BET`/`MAX_BET`. CLOB `minimum_order_size` is shares (BTC 5m commonly 5 shares), not a fixed $5 notional; for FAK BUY market orders the bot ensures the dollar amount can buy at least `mos` shares at the worst-price cap.
 
-### Exit: stop-loss/prob-stop when enabled, otherwise hold to resolution
+Execution policy is intentionally narrow: huge-edge FAK taker only. Default `ENTRY_HUGE_EDGE_MIN=0.15`; signals with lower fee-adjusted edge are skipped. GTD/post-only maker entry was removed because it conflicts with the oracle-lag thesis: if the edge is real and large, immediate execution is worth more than maker fee savings; if the edge is not large, do not trade.
 
-Current code supports optional exits during the 5-minute window:
-- `STOP_LOSS_ENABLED=true` (default currently in code) enables a price stop and probability stop.
-- Price stop: current sell price <= entry price × `(1 - STOP_LOSS_PCT)`.
-- Probability stop: model probability for held side <= `STOP_PROB_FLOOR`.
-- If `STOP_LOSS_ENABLED=false`, the bot holds to resolution.
+### Exit: hold to resolution
 
-Important: older analysis showed stops can destroy value in this market because BTC micro-bounces can trigger exits that later resolve correctly. Treat stops as an explicit live-risk choice, not the default strategy thesis. The bot startup and trade-entry logs must state the actual active exit policy.
+Default and intended policy is hold-to-resolution. `STOP_LOSS_ENABLED` defaults to `false`; stop-loss/prob-stop code is not used in the live position manager. Sell prices and held-side Brownian probability are monitored for diagnostics/calibration only. Older analysis showed stops can destroy value in this market because BTC micro-bounces can trigger exits that later resolve correctly.
+
+For LIVE resolution, Binance is not final truth. Reconcile using Polymarket claim/order result, official outcome/CSV, and collateral balance. Binance final price is logged only as diagnostic context or dry-run simulation fallback.
 
 ---
 
@@ -113,29 +111,17 @@ Before any sell: check `shares × price ≥ $5`. If below, don't attempt — hol
 
 ## Critical technical knowledge
 
-### Two-book architecture
+### Two-book architecture and FAK execution
 
 Polymarket has TWO order books per token:
-- **Raw token book**: illiquid, $0.06/$0.94 spread, almost no volume. `create_order` with default routing lands here.
+- **Raw token book**: illiquid, $0.06/$0.94 spread, almost no volume.
 - **Complement engine book**: tight 1¢ spreads, all real volume. This is where market makers and the UI trade.
 
-All orders MUST route through the complement engine. `create_order(OrderArgs)` routes correctly when you specify price and size. `create_market_order(MarketOrderArgs)` also routes through complement engine but has float precision issues (see below).
+Current v14 entry uses `create_market_order(MarketOrderArgsV2)` + `post_order(..., OrderType.FAK, post_only=False)` for huge-edge taker buys only. Official docs: BUY market orders specify dollar amount; FAK executes immediately against resting liquidity and cancels the remainder. Always pass a worst-price cap and verify by balance/order status.
 
-### Float precision — the decimal bug
+### Float precision warning
 
-The py-clob-client-v2 library may still compute complement amounts with float math on some market-order paths:
-```python
-1.0 - 0.71 = 0.29000000000000004  # IEEE 754 artifact
-21 * 0.29000000000000004 * 1e6 = 6090000.000000001  # Violates 4-decimal rule
-```
-
-Polymarket CLOB rejects: `"invalid amounts, max accuracy of 4 decimals"`
-
-**The fix**: Use `create_order(OrderArgs(price=round(price, 2), size=float(int(shares))))` — pass integer shares and 2-decimal prices. The library never divides. This was the v10 fix that got lost during file shuffles and had to be re-applied.
-
-DO NOT use `create_market_order(MarketOrderArgs(amount=X))` for buys — the library internally divides `amount/price` producing `21.000000000004` shares.
-
-Sells still use `create_market_order` because the sell path doesn't have the same complement computation issue.
+Older versions avoided BUY market orders because some py-clob-client paths divided `amount/price` and produced share precision artifacts such as `21.000000000004`, rejected as `"invalid amounts, max accuracy of 4 decimals"`. v14 deliberately accepts the market-order path only for huge-edge FAK execution; if this error reappears in live logs, do not silently fall back to GTD/post-only. Either fix the SDK/order builder path or skip the trade.
 
 ### Gamma API parsing
 
@@ -151,7 +137,7 @@ CLOB API blocks POST `/order` from datacenter/VPN IPs. Resolved by routing throu
 
 ### Order verification timing
 
-`create_order` (limit order) routes through complement engine in 5-15s (slower than market orders). Initial wait is 5s, then 3 rounds of verification at 3s intervals = ~14s total. If still unverified, return `UNVERIFIED_BUY` — never cancel.
+FAK market orders should resolve immediately at the CLOB matching layer, but Polygon/balance settlement can still lag. The bot waits 5s, then performs 3 verification rounds at 3s intervals. If still unverified, return `UNVERIFIED_BUY` — never cancel based solely on local timeout; detect via balance sync at the next window boundary.
 
 ---
 
@@ -208,13 +194,16 @@ DRY_RUN=false
 # Strategy
 MIN_EDGE=0.05
 MIN_PROB=0.80
-SAFETY_FACTOR=0.85
+ENTRY_HUGE_EDGE_MIN=0.15
 ENTRY_WINDOW_START=240
 ENTRY_WINDOW_END=10
 KELLY_FRACTION=0.25
 MIN_BET=5.0
 MAX_BET=25.0
 BANKROLL=100.0
+
+# Exit policy
+STOP_LOSS_ENABLED=false
 
 # Safety
 DAILY_LOSS_LIMIT=30
