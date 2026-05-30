@@ -84,6 +84,24 @@ class MarkovPersistenceFilter:
     def persistence(self, direction: Direction) -> float:
         return float(self.transition_stats(direction)["persistence"])
 
+    def price_change_pct(self, lookback_seconds: float, now: Optional[float] = None) -> float:
+        """Return price momentum over a recent lookback window in percent."""
+        if len(self._samples) < 2:
+            return 0.0
+        ts = time.time() if now is None else now
+        cutoff = ts - max(0.0, float(lookback_seconds))
+        latest_ts, latest_price = self._samples[-1]
+        base_price = 0.0
+        for sample_ts, sample_price in reversed(self._samples):
+            if sample_ts <= cutoff:
+                base_price = sample_price
+                break
+        if base_price <= 0:
+            base_price = self._samples[0][1]
+        if latest_price <= 0 or base_price <= 0:
+            return 0.0
+        return (latest_price - base_price) / base_price * 100.0
+
     def passes(self, direction: Direction, threshold: float = 0.87) -> bool:
         return self.persistence(direction) >= threshold
 

@@ -13,6 +13,7 @@ reduced or skipped instead of pretending a single CEX tick is ground truth.
 from __future__ import annotations
 
 import json
+import statistics
 import time
 import threading
 import urllib.parse
@@ -245,24 +246,96 @@ class PolymarketReferenceFeed:
 class SourceConsensusGate:
     def __init__(self, config: SourceConsensusConfig):
         self.config = config
-        self._basis_samples: deque[float] = deque(maxlen=max(1, config.basis_window))
+        self._basis_samples: deque[tuple[float, float]] = deque(maxlen=max(1, config.basis_window))
+        self._seen_sample_timestamps: deque[float] = deque(maxlen=max(1, config.basis_window * 4))
+        self._latest_snapshot: Optional[SourceConsensusDecision] = None
+        self._lock = threading.Lock()
 
     @property
     def basis_mean_bps(self) -> float:
-        if len(self._basis_samples) >= self.config.min_basis_samples:
-            return sum(self._basis_samples) / len(self._basis_samples)
+        # Backward-compatible name. This is deliberately a rolling median now,
+        # not a mean of the last 24 hot-loop ticks. The prior implementation
+        # sampled every assess() call, so "24" meant ~2-3 seconds, not 24 windows.
+        with self._lock:
+            values = [basis for _, basis in self._basis_samples]
+        if len(values) >= self.config.min_basis_samples:
+            return float(statistics.median(values))
         return self.config.default_basis_bps
 
     @property
     def basis_sample_count(self) -> int:
-        return len(self._basis_samples)
+        with self._lock:
+            return len(self._basis_samples)
 
-    def record_basis(self, reference_price: float, binance_price: float) -> Optional[float]:
+    def record_basis(
+        self,
+        reference_price: float,
+        binance_price: float,
+        sample_timestamp: Optional[float] = None,
+    ) -> Optional[float]:
         if reference_price <= 0 or binance_price <= 0:
             return None
+        ts = time.time() if sample_timestamp is None else float(sample_timestamp)
         basis = (reference_price - binance_price) / binance_price * 10000.0
-        self._basis_samples.append(basis)
+        with self._lock:
+            if any(abs(ts - seen) < 1e-6 for seen in self._seen_sample_timestamps):
+                return None
+            self._basis_samples.append((ts, basis))
+            self._seen_sample_timestamps.append(ts)
         return basis
+
+    def update_snapshot(
+        self,
+        *,
+        binance_price: float,
+        opening_price: float,
+        intended_side: str,
+        reference: Optional[ReferencePrice],
+    ) -> SourceConsensusDecision:
+        decision = self.assess(
+            binance_price=binance_price,
+            opening_price=opening_price,
+            intended_side=intended_side,
+            reference=reference,
+            record_sample=True,
+        )
+        with self._lock:
+            self._latest_snapshot = decision
+        return decision
+
+    def assess_snapshot(self, intended_side: str) -> SourceConsensusDecision:
+        with self._lock:
+            snapshot = self._latest_snapshot
+        if snapshot is None:
+            return self._decision(
+                "skip",
+                "source_snapshot_missing",
+                0.0,
+                0.0,
+                intended_side,
+                None,
+                self.basis_mean_bps,
+                None,
+                None,
+            )
+        if snapshot.adjusted_side != intended_side:
+            return self._decision(
+                "skip",
+                "source_snapshot_side_disagrees",
+                0.0,
+                snapshot.adjusted_price,
+                snapshot.adjusted_side,
+                snapshot.basis_bps,
+                snapshot.basis_mean_bps,
+                snapshot.basis_deviation_bps,
+                ReferencePrice(
+                    price=snapshot.reference_price or 0.0,
+                    source="snapshot",
+                    timestamp=time.time() - float(snapshot.reference_age_seconds or 0.0),
+                    age_seconds=float(snapshot.reference_age_seconds or 0.0),
+                ) if snapshot.reference_price else None,
+            )
+        return snapshot
 
     def assess(
         self,
@@ -271,6 +344,7 @@ class SourceConsensusGate:
         opening_price: float,
         intended_side: str,
         reference: Optional[ReferencePrice],
+        record_sample: bool = True,
     ) -> SourceConsensusDecision:
         mean_basis = self.basis_mean_bps
         adjusted_price = binance_price * (1.0 + mean_basis / 10000.0) if binance_price > 0 else 0.0
@@ -301,7 +375,7 @@ class SourceConsensusGate:
                 return self._decision("skip", "missing_polymarket_chainlink_reference", 0.0, adjusted_price, adjusted_side, None, mean_basis, None, reference)
             return self._decision("downsize", "missing_reference_downsize", self.config.downsize_factor, adjusted_price, adjusted_side, None, mean_basis, None, reference)
 
-        basis = self.record_basis(reference.price, binance_price)
+        basis = self.record_basis(reference.price, binance_price, sample_timestamp=reference.timestamp) if record_sample else (reference.price - binance_price) / binance_price * 10000.0
         deviation = abs((basis or mean_basis) - mean_basis)
         reference_side = "UP" if reference.price >= opening_price else "DOWN"
 
