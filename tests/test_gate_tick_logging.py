@@ -10,19 +10,18 @@ def test_tracker_logs_gate_level_tick_diagnostics(tmp_path):
         action="pass",
         reason="source_consensus_ok",
         size_multiplier=1.0,
-        adjusted_price=101.0,
-        adjusted_side="UP",
-        reference_price=100.9,
-        reference_age_seconds=1.2,
-        basis_bps=-1.0,
-        basis_mean_bps=-0.5,
-        basis_deviation_bps=0.5,
+        signal_price=101.0,
+        signal_side="UP",
+        chainlink_price=100.9,
+        chainlink_age_seconds=1.2,
+        source_gap_bps=1.0,
+        direct_vs_rtds_binance_gap_bps=0.5,
     )
 
     tracker.log_gate_tick(
         window_ts=1710000000,
         btc_price=101.0,
-        adjusted_btc_price=101.0,
+        signal_btc_price=101.0,
         opening_price=100.0,
         up_price=0.99,
         down_price=0.01,
@@ -51,8 +50,9 @@ def test_tracker_logs_gate_level_tick_diagnostics(tmp_path):
 
     assert len(rows) == 1
     row = rows[0]
+    assert row["signal_btc_price"] == "101.0"
     assert row["gate_reason"] == "markov_persistence_below_threshold"
     assert row["book_state"] == "target_extreme_high_no_margin"
     assert row["extreme_book"] == "1"
     assert row["markov_flat_samples"] == "500"
-    assert row["reference_age_seconds"] == "1.2"
+    assert row["chainlink_age_seconds"] == "1.2"

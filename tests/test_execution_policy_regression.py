@@ -119,21 +119,16 @@ def test_execute_trade_skips_non_huge_edge_before_buy(monkeypatch, tmp_path):
             raise AssertionError("non-huge edge should not submit any buy")
 
     class FakeSourceConsensus:
-        basis_mean_bps = 0.0
-
         def assess_snapshot(self, side):
             from source_consensus import SourceConsensusDecision
             return SourceConsensusDecision(
                 action="normal",
                 reason="sources_agree",
                 size_multiplier=1.0,
-                adjusted_price=75100.0,
-                adjusted_side="UP",
-                basis_bps=0.0,
-                basis_mean_bps=0.0,
-                basis_deviation_bps=0.0,
-                reference_price=75100.0,
-                reference_age_seconds=0.1,
+                signal_price=75100.0,
+                signal_side="UP",
+                chainlink_price=75100.0,
+                chainlink_age_seconds=0.1,
             )
 
     class FakePriceFeed:

@@ -29,6 +29,10 @@ class TradeSignal:
     markov_regime: str = "markov_strong"
     edge_required: float = 0.05
     markov_size_multiplier: float = 1.0
+    # Delta used by the probability model. In live this is the de-biased Binance
+    # window move (Binance-now vs Binance-window-open) — the same anchor as the
+    # signal, NOT Chainlink-vs-open whose ~14bps basis poisons the direction.
+    model_delta_pct: float = 0.0
 
 
 @dataclass
@@ -335,6 +339,7 @@ def get_skip_reason(
     markov_persistence: float = 1.0,
     markov_stats: Optional[dict] = None,
     fee_rate_bps: float = 0.0,
+    probability_price: Optional[float] = None,
 ) -> str:
     """Return why evaluate() returned None, for signal logging.
 
@@ -352,13 +357,19 @@ def get_skip_reason(
     if seconds_remaining < config.entry_window_end:
         return "after_entry_window"
     btc_delta_pct = ((btc_price - opening_price) / opening_price) * 100
+    model_price = probability_price if probability_price is not None else btc_price
+    model_delta_pct = ((model_price - opening_price) / opening_price) * 100
+    signal_side = "UP" if btc_delta_pct > 0 else "DOWN"
+    model_side = "UP" if model_delta_pct > 0 else "DOWN"
     if abs(btc_delta_pct) < config.min_btc_delta:
         return "delta_too_small"
-    market_price = up_market_price if btc_delta_pct > 0 else down_market_price
+    if model_side != signal_side:
+        return "model_source_side_disagrees"
+    market_price = up_market_price if signal_side == "UP" else down_market_price
     if market_price > config.max_price or market_price < config.min_price:
         return "price_out_of_range"
     vol = realized_vol if realized_vol is not None else 0.12
-    true_prob = estimate_true_probability(btc_delta_pct, seconds_remaining, vol=vol)
+    true_prob = estimate_true_probability(model_delta_pct, seconds_remaining, vol=vol)
     if true_prob < config.min_prob:
         return "prob_below_min"
     edge = true_prob - market_price
@@ -396,6 +407,7 @@ def evaluate(
     markov_persistence: float = 1.0,
     markov_stats: Optional[dict] = None,
     fee_rate_bps: float = 0.0,
+    probability_price: Optional[float] = None,
 ) -> Optional[TradeSignal]:
     """Evaluate whether to enter a trade.
 
@@ -417,18 +429,23 @@ def evaluate(
         return None
 
     btc_delta_pct = ((btc_price - opening_price) / opening_price) * 100
+    model_price = probability_price if probability_price is not None else btc_price
+    model_delta_pct = ((model_price - opening_price) / opening_price) * 100
 
     if abs(btc_delta_pct) < config.min_btc_delta:
         return None
 
     side = "UP" if btc_delta_pct > 0 else "DOWN"
-    market_price = up_market_price if btc_delta_pct > 0 else down_market_price
+    model_side = "UP" if model_delta_pct > 0 else "DOWN"
+    if model_side != side:
+        return None
+    market_price = up_market_price if side == "UP" else down_market_price
 
     if market_price > config.max_price or market_price < config.min_price:
         return None
 
     vol = realized_vol if realized_vol is not None else 0.12
-    true_prob = estimate_true_probability(btc_delta_pct, seconds_remaining, vol=vol)
+    true_prob = estimate_true_probability(model_delta_pct, seconds_remaining, vol=vol)
 
     # Filter 1: Model must be confident enough
     if true_prob < config.min_prob:
@@ -481,4 +498,5 @@ def evaluate(
         markov_regime=risk.regime,
         edge_required=risk.edge_required,
         markov_size_multiplier=risk.size_multiplier,
+        model_delta_pct=model_delta_pct,
     )

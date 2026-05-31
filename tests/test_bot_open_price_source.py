@@ -34,7 +34,11 @@ def test_new_window_uses_polymarket_open_price_instead_of_first_binance_tick(mon
 
     bot._on_new_window(1779883800, closing_btc_price=75800.0)
 
-    assert bot._opening_price == 75769.18
+    # _opening_price is now the Binance window-open (boundary tick); the
+    # Polymarket/Chainlink settlement open is captured separately and must not
+    # be lost.
+    assert bot._opening_price == 75800.0
+    assert bot._chainlink_open_price == 75769.18
 
 
 def test_new_window_retries_for_polymarket_open_price_before_fallback(monkeypatch):
@@ -72,7 +76,8 @@ def test_new_window_retries_for_polymarket_open_price_before_fallback(monkeypatc
     bot._on_new_window(1779883800, closing_btc_price=75800.0)
 
     assert len(calls) == 2
-    assert bot._opening_price == 75769.18
+    assert bot._opening_price == 75800.0
+    assert bot._chainlink_open_price == 75769.18
     assert bot._window_open_price_missing is False
 
 
@@ -95,6 +100,9 @@ def test_live_new_window_skips_trading_when_official_open_price_missing(monkeypa
 
     bot._on_new_window(1779883800, closing_btc_price=75800.0)
 
-    assert bot._opening_price == 0.0
+    # Binance anchor is still captured from the boundary tick; only the
+    # Chainlink settlement open is missing, which is what halts live trading.
+    assert bot._opening_price == 75800.0
+    assert bot._chainlink_open_price == 0.0
     assert bot._window_open_price_missing is True
     assert bot._trade_attempted is True

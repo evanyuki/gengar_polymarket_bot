@@ -77,6 +77,9 @@ TRADE_FIELDS = [
     "exit_latency_ms",
     # Resolution
     "btc_final_price", "btc_final_delta_pct",
+    "final_price_source",
+    "official_open_price", "official_close_price", "official_delta_pct",
+    "official_winning_side",
     "won_resolution",           # Did BTC go our way?
     "resolution_payout",        # What resolution would have paid
     "resolution_method",        # "claim_sell", "balance_check", "official_csv", "dry_binance_fallback", "exited"
@@ -100,15 +103,15 @@ EXECUTION_FIELDS = [
 
 GATE_TICK_FIELDS = [
     "timestamp", "window_ts", "window_time",
-    "btc_price", "adjusted_btc_price", "opening_price", "btc_delta_pct",
+    "btc_price", "signal_btc_price", "opening_price", "btc_delta_pct",
     "up_price", "down_price", "seconds_remaining",
     "candidate_side", "candidate_market_price", "opposite_market_price",
     "true_prob", "raw_edge", "fee_adjusted_edge", "kelly_size",
     "markov_persistence", "markov_same", "markov_total",
     "markov_directional_samples", "markov_flat_samples", "markov_threshold",
     "realized_vol", "fee_rate_bps",
-    "source_action", "source_reason", "reference_age_seconds",
-    "basis_bps", "basis_mean_bps", "basis_deviation_bps",
+    "source_action", "source_reason", "chainlink_age_seconds", "rtds_binance_age_seconds",
+    "source_gap_bps", "direct_vs_rtds_binance_gap_bps",
     "momentum_15s_pct", "momentum_30s_pct", "entry_spread", "book_imbalance",
     "time_bucket", "delta_bucket", "prob_bucket", "price_bucket", "edge_bucket",
     "gate_reason", "signal_ready", "extreme_book", "book_state",
@@ -271,7 +274,7 @@ class Tracker:
         self,
         window_ts: int,
         btc_price: float,
-        adjusted_btc_price: float,
+        signal_btc_price: float,
         opening_price: float,
         up_price: float,
         down_price: float,
@@ -304,13 +307,13 @@ class Tracker:
         edge_bucket: str = "",
     ):
         markov_stats = markov_stats or {}
-        btc_delta_pct = ((adjusted_btc_price - opening_price) / opening_price * 100) if opening_price > 0 else 0.0
+        btc_delta_pct = ((signal_btc_price - opening_price) / opening_price * 100) if opening_price > 0 else 0.0
         row = {
             "timestamp": time.time(),
             "window_ts": window_ts,
             "window_time": time.strftime("%H:%M", time.localtime(window_ts)),
             "btc_price": round(btc_price, 2),
-            "adjusted_btc_price": round(adjusted_btc_price, 2),
+            "signal_btc_price": round(signal_btc_price, 2),
             "opening_price": round(opening_price, 2),
             "btc_delta_pct": round(btc_delta_pct, 4),
             "up_price": round(up_price, 3),
@@ -333,10 +336,10 @@ class Tracker:
             "fee_rate_bps": round(fee_rate_bps, 4),
             "source_action": getattr(source_decision, "action", ""),
             "source_reason": getattr(source_decision, "reason", ""),
-            "reference_age_seconds": round(getattr(source_decision, "reference_age_seconds", 0.0) or 0.0, 3),
-            "basis_bps": round(getattr(source_decision, "basis_bps", 0.0) or 0.0, 4),
-            "basis_mean_bps": round(getattr(source_decision, "basis_mean_bps", 0.0) or 0.0, 4),
-            "basis_deviation_bps": round(getattr(source_decision, "basis_deviation_bps", 0.0) or 0.0, 4),
+            "chainlink_age_seconds": round(getattr(source_decision, "chainlink_age_seconds", 0.0) or 0.0, 3),
+            "rtds_binance_age_seconds": round(getattr(source_decision, "rtds_binance_age_seconds", 0.0) or 0.0, 3),
+            "source_gap_bps": round(getattr(source_decision, "source_gap_bps", 0.0) or 0.0, 4),
+            "direct_vs_rtds_binance_gap_bps": round(getattr(source_decision, "direct_vs_rtds_binance_gap_bps", 0.0) or 0.0, 4),
             "momentum_15s_pct": round(momentum_15s_pct, 4),
             "momentum_30s_pct": round(momentum_30s_pct, 4),
             "entry_spread": round(entry_spread, 4),
@@ -440,6 +443,10 @@ class Tracker:
         exit_revenue: float = 0.0,
         resolution_method: str = "unresolved",
         claim_result: str = "not_attempted",
+        final_price_source: str = "unknown",
+        official_open_price: float = 0.0,
+        official_close_price: float = 0.0,
+        official_completed: bool = False,
     ):
         if not self._current_trade:
             return
@@ -448,11 +455,24 @@ class Tracker:
         entry_shares = self._current_trade.get("entry_shares", 0)
 
         btc_delta = ((btc_final_price - opening_price) / opening_price * 100) if opening_price > 0 else 0
+        official_delta = (
+            (official_close_price - official_open_price) / official_open_price * 100
+            if official_open_price > 0 and official_close_price > 0
+            else 0.0
+        )
+        official_winning_side = ""
+        if official_open_price > 0 and official_close_price > 0 and official_completed:
+            official_winning_side = "UP" if official_close_price >= official_open_price else "DOWN"
         resolution_payout = entry_shares * 1.0 if won else 0.0
         profit_if_held = resolution_payout - entry_cost
 
         self._current_trade["btc_final_price"] = round(btc_final_price, 2)
         self._current_trade["btc_final_delta_pct"] = round(btc_delta, 4)
+        self._current_trade["final_price_source"] = final_price_source
+        self._current_trade["official_open_price"] = round(official_open_price, 2) if official_open_price > 0 else 0.0
+        self._current_trade["official_close_price"] = round(official_close_price, 2) if official_close_price > 0 else 0.0
+        self._current_trade["official_delta_pct"] = round(official_delta, 4)
+        self._current_trade["official_winning_side"] = official_winning_side
         self._current_trade["won_resolution"] = won
         self._current_trade["resolution_payout"] = round(resolution_payout, 2)
         self._current_trade["resolution_method"] = resolution_method
@@ -649,22 +669,16 @@ class Tracker:
                 writer.writeheader()
             return
 
-        # Schema migration: append-only CSVs may already exist from older bot
-        # versions. If a new observability column is added, rewrite only the
-        # header/rows to include it, preserving all historical values.
+        # Schema migration: incompatible old CSVs are reset. Mixing legacy
+        # adjusted/basis rows with RTDS-source rows corrupts analysis.
         try:
             with open(path, newline="") as f:
-                reader = csv.DictReader(f)
-                existing_fields = reader.fieldnames or []
-                if all(field in existing_fields for field in fields):
-                    return
-                rows = list(reader)
-
+                existing_fields = csv.DictReader(f).fieldnames or []
+            if existing_fields == fields:
+                return
             with open(path, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fields)
                 writer.writeheader()
-                for row in rows:
-                    writer.writerow({field: row.get(field, "") for field in fields})
         except Exception as e:
             print(f"[tracker] Header migration failed for {path}: {e}")
 

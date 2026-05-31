@@ -185,6 +185,7 @@ def test_reverse_orderbook_pre_entry_gate_skips_live_buy(monkeypatch, tmp_path):
     polybot = bot.PolyBot()
     polybot._current_window = 1710000000
     polybot._opening_price = 75000.0
+    polybot._chainlink_open_price = 75000.0
     polybot._cached_up = 0.54
     polybot._cached_down = 0.47
 
@@ -211,14 +212,23 @@ def test_reverse_orderbook_pre_entry_gate_skips_live_buy(monkeypatch, tmp_path):
             return 75300.0, True
 
     class FakeReference:
-        price = 75170.0
+        price = 75220.0
         source = "test_chainlink"
+        timestamp = 1710000000.0
+        age_seconds = 0.1
+
+    class FakeRtdsBinance:
+        price = 75300.0
+        source = "test_rtds_binance"
         timestamp = 1710000000.0
         age_seconds = 0.1
 
     class FakeReferenceFeed:
         def get_latest(self):
             return FakeReference()
+
+        def get_binance_latest(self):
+            return FakeRtdsBinance()
 
         def update_from_rest(self, window_ts, window_end_ts):
             return FakeReference()
@@ -234,7 +244,7 @@ def test_reverse_orderbook_pre_entry_gate_skips_live_buy(monkeypatch, tmp_path):
     polybot.executor = FakeExecutor()
     polybot._orderbook_cache_enabled = False
     polybot.price_feed = FakePriceFeed()
-    polybot.reference_feed = FakeReferenceFeed()
+    polybot.rtds_feed = FakeReferenceFeed()
     polybot.tracker = FakeTracker()
 
     sig = TradeSignal(
@@ -321,20 +331,15 @@ def test_final_prebuy_recheck_uses_same_realized_vol_as_signal_gate(monkeypatch,
             return None
 
     class FakeSourceConsensus:
-        basis_mean_bps = 0.0
-
         def assess_snapshot(self, side):
             return SourceConsensusDecision(
                 action="normal",
                 reason="source_consensus_ok",
                 size_multiplier=1.0,
-                adjusted_price=99.9164,
-                adjusted_side="DOWN",
-                basis_bps=0.0,
-                basis_mean_bps=0.0,
-                basis_deviation_bps=0.0,
-                reference_price=None,
-                reference_age_seconds=None,
+                signal_price=99.9164,
+                signal_side="DOWN",
+                chainlink_price=None,
+                chainlink_age_seconds=None,
             )
 
     class FakeTracker:
@@ -355,7 +360,7 @@ def test_final_prebuy_recheck_uses_same_realized_vol_as_signal_gate(monkeypatch,
     monkeypatch.setattr(bot, "get_current_market", lambda period: FakeMarket())
     polybot.executor = FakeExecutor()
     polybot.price_feed = FakePriceFeed()
-    polybot.reference_feed = FakeReferenceFeed()
+    polybot.rtds_feed = FakeReferenceFeed()
     polybot.source_consensus = FakeSourceConsensus()
     polybot.tracker = FakeTracker()
     polybot.telegram = FakeTelegram()

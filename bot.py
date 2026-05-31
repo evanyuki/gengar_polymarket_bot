@@ -35,10 +35,10 @@ from dotenv import load_dotenv
 import logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-from market import get_current_market, PERIOD_SECONDS
+from market import fetch_crypto_window_price, get_current_market, PERIOD_SECONDS
 from price_feed import BinancePriceFeed
 from source_consensus import (
-    PolymarketReferenceFeed,
+    PolymarketRtdsFeed,
     SourceConsensusConfig,
     SourceConsensusGate,
 )
@@ -203,24 +203,26 @@ class PolyBot:
         self._open_price_initial_delay: float = float(os.getenv("OPEN_PRICE_INITIAL_DELAY_SECONDS", "6"))
         self._open_price_wait_seconds: float = float(os.getenv("OPEN_PRICE_WAIT_SECONDS", "12"))
         self._open_price_retry_interval: float = float(os.getenv("OPEN_PRICE_RETRY_INTERVAL", "2"))
-        self._huge_edge_min: float = float(os.getenv("ENTRY_HUGE_EDGE_MIN", "0.15"))
+        self._huge_edge_min: float = float(os.getenv("ENTRY_HUGE_EDGE_MIN", "0.18"))
         self._fak_slippage_ticks: int = int(os.getenv("ENTRY_FAK_SLIPPAGE_TICKS", "1"))
         self._entry_max_spread: float = float(os.getenv("ENTRY_MAX_SPREAD", "0.08"))
         self._entry_min_exit_price: float = float(os.getenv("ENTRY_MIN_EXIT_PRICE", "0.50"))
         self._source_consensus_config = SourceConsensusConfig(
             enabled=os.getenv("SOURCE_CONSENSUS_ENABLED", "true").lower() == "true",
-            require_live_reference=os.getenv(
-                "SOURCE_REQUIRE_LIVE_REFERENCE",
+            require_chainlink=os.getenv(
+                "SOURCE_REQUIRE_CHAINLINK",
                 "true" if not self.dry_run else "false",
             ).lower() == "true",
-            default_basis_bps=float(os.getenv("SOURCE_DEFAULT_BASIS_BPS", "-14.6")),
-            max_basis_deviation_bps=float(os.getenv("SOURCE_BASIS_SKIP_BPS", "8.0")),
-            downsize_basis_deviation_bps=float(os.getenv("SOURCE_BASIS_DOWNSIZE_BPS", "5.0")),
+            require_rtds_binance=os.getenv(
+                "SOURCE_REQUIRE_RTDS_BINANCE",
+                "true" if not self.dry_run else "false",
+            ).lower() == "true",
             stale_downsize_seconds=float(os.getenv("SOURCE_STALE_DOWNSIZE_SEC", "10.0")),
             stale_skip_seconds=float(os.getenv("SOURCE_STALE_SKIP_SEC", "30.0")),
             downsize_factor=float(os.getenv("SOURCE_DOWNSIZE_FACTOR", "0.50")),
-            min_basis_samples=int(os.getenv("SOURCE_BASIS_MIN_SAMPLES", "6")),
-            basis_window=int(os.getenv("SOURCE_BASIS_WINDOW", "24")),
+            max_rtds_source_gap_bps=float(os.getenv("SOURCE_RTDS_SOURCE_GAP_BPS", "25.0")),
+            max_direct_vs_rtds_binance_gap_bps=float(os.getenv("SOURCE_DIRECT_VS_RTDS_BINANCE_GAP_BPS", "6.0")),
+            min_chainlink_delta_pct=float(os.getenv("CHAINLINK_MIN_DELTA_PCT", "0.02")),
         )
         self.source_consensus = SourceConsensusGate(self._source_consensus_config)
         self._orderbook_cache_enabled: bool = os.getenv("CLOB_ORDERBOOK_CACHE_ENABLED", "true").lower() == "true"
@@ -229,7 +231,7 @@ class PolyBot:
         self._current_market = None
 
         self.price_feed = BinancePriceFeed()
-        self.reference_feed = PolymarketReferenceFeed("BTC")
+        self.rtds_feed = PolymarketRtdsFeed("BTC")
         self.executor = Executor(
             private_key=os.getenv("PRIVATE_KEY", ""),
             safe_address=os.getenv("SAFE_ADDRESS", ""),
@@ -245,7 +247,14 @@ class PolyBot:
 
         self._running = False
         self._current_window: int = 0
+        # _opening_price is the Binance window-open (de-biased signal anchor):
+        # the bot's own Binance price at the window boundary. All Binance-delta
+        # signal/model/log math anchors to this. _chainlink_open_price is the
+        # Chainlink/Polymarket settlement open, used only for Chainlink-side
+        # source-consensus checks and settlement reconciliation. They differ by a
+        # near-constant Binance/Chainlink basis (~14bps) — never mix them.
         self._opening_price: float = 0.0
+        self._chainlink_open_price: float = 0.0
         self._window_open_price_missing: bool = False
         self._last_hour_check: int = 0
         self._dry_run_started_at: float = time.time()
@@ -341,8 +350,8 @@ class PolyBot:
         )
         print(
             f"  Source gate: {'ON' if self._source_consensus_config.enabled else 'OFF'} | "
-            f"basis default {self._source_consensus_config.default_basis_bps:+.1f}bps | "
-            f"skip dev>{self._source_consensus_config.max_basis_deviation_bps:.1f}bps | "
+            f"RTDS Binance required={self._source_consensus_config.require_rtds_binance} | "
+            f"RTDS/CL abnormal gap>{self._source_consensus_config.max_rtds_source_gap_bps:.1f}bps | "
             f"stale skip>{self._source_consensus_config.stale_skip_seconds:.0f}s"
         )
         print(
@@ -378,7 +387,7 @@ class PolyBot:
             self.tracker.set_session_balance(self.stats.bankroll)
 
         self.price_feed.start()
-        self.reference_feed.start()
+        self.rtds_feed.start()
         print("\n⏳ Waiting for BTC price...")
         price = self.price_feed.wait_for_price(timeout=30)
         if not price:
@@ -501,11 +510,13 @@ class PolyBot:
 
         seconds_remaining = (window_ts + period_secs) - now
 
+        # Capture the Binance window-open if the boundary tick was missing.
         if self._opening_price <= 0:
-            if not self.dry_run and self._window_open_price_missing:
-                return
             self._opening_price = btc_price
-            print(f"  📌 Open: ${btc_price:,.2f}")
+            print(f"  📌 BN open: ${btc_price:,.2f}")
+        # Live trading needs the Chainlink settlement open for source-consensus.
+        if not self.dry_run and self._window_open_price_missing:
+            return
 
         # HOLDING: active position management
         if self._traded:
@@ -516,30 +527,30 @@ class PolyBot:
         if self._traded or self._trade_attempted:
             return
 
-        # IDLE: look for entry. Binance is the low-latency input, but the
-        # strategy is evaluated on a Binance price adjusted by the observed
-        # Chainlink/Polymarket basis so we do not mix a Binance tick with a
-        # Chainlink official open anchor.
-        reference_price = self.reference_feed.get_latest()
-        adjusted_btc_price = btc_price
-        if self._source_consensus_config.enabled:
-            adjusted_btc_price = btc_price * (1.0 + self.source_consensus.basis_mean_bps / 10000.0)
+        # IDLE: Binance direct WS is the low-latency signal; RTDS Binance and
+        # RTDS Chainlink are risk sources, compared directly.
+        chainlink_price = self.rtds_feed.get_latest()
+        get_rtds_binance = getattr(self.rtds_feed, "get_binance_latest", None)
+        rtds_binance_price = get_rtds_binance() if callable(get_rtds_binance) else None
+        signal_btc_price = btc_price
 
-        up_price, down_price = self._get_market_prices(adjusted_btc_price, seconds_remaining)
+        up_price, down_price = self._get_market_prices(signal_btc_price, seconds_remaining)
 
         realized_vol = self._compute_realized_vol()
-        candidate_side = "UP" if adjusted_btc_price >= self._opening_price else "DOWN"
+        candidate_side = "UP" if signal_btc_price >= self._opening_price else "DOWN"
         source_decision = self.source_consensus.update_snapshot(
             binance_price=btc_price,
-            opening_price=self._opening_price,
+            opening_price=self._chainlink_open_price,
             intended_side=candidate_side,
-            reference=reference_price,
+            chainlink=chainlink_price,
+            rtds_binance=rtds_binance_price,
+            binance_opening_price=self._opening_price,
         )
         markov_persistence = self._markov_filter.persistence(candidate_side)
         markov_stats = self._markov_filter.transition_stats(candidate_side)
         fee_rate_bps = self._cached_up_fee_bps if candidate_side == "UP" else self._cached_down_fee_bps
         signal_result = evaluate(
-            btc_price=adjusted_btc_price,
+            btc_price=signal_btc_price,
             opening_price=self._opening_price,
             up_market_price=up_price,
             down_market_price=down_price,
@@ -551,11 +562,14 @@ class PolyBot:
             markov_stats=markov_stats,
             fee_rate_bps=fee_rate_bps,
         )
-
         candidate_market_price = up_price if candidate_side == "UP" else down_price
         opposite_market_price = down_price if candidate_side == "UP" else up_price
-        btc_delta_pct = ((adjusted_btc_price - self._opening_price) / self._opening_price * 100) if self._opening_price > 0 else 0.0
-        true_prob = estimate_true_probability(btc_delta_pct, seconds_remaining, vol=realized_vol)
+        btc_delta_pct = ((signal_btc_price - self._opening_price) / self._opening_price * 100) if self._opening_price > 0 else 0.0
+        # Model runs on the de-biased Binance move (same anchor as the signal),
+        # NOT Chainlink-vs-open: the ~14bps basis would otherwise poison the
+        # probability and force model_side to disagree with the signal.
+        model_delta_pct = btc_delta_pct
+        true_prob = estimate_true_probability(model_delta_pct, seconds_remaining, vol=realized_vol)
         candidate_true_prob = true_prob
         raw_edge = candidate_true_prob - candidate_market_price
         net_edge = fee_adjusted_edge(candidate_true_prob, candidate_market_price, fee_rate_bps)
@@ -569,7 +583,7 @@ class PolyBot:
             fee_rate_bps=fee_rate_bps,
         )
         gate_reason = "signal_ready" if signal_result else get_skip_reason(
-            btc_price=adjusted_btc_price,
+            btc_price=signal_btc_price,
             opening_price=self._opening_price,
             up_market_price=up_price,
             down_market_price=down_price,
@@ -594,7 +608,7 @@ class PolyBot:
         book_imbalance = candidate_market_price - opposite_market_price
         buckets = calibration_buckets(
             seconds_remaining=seconds_remaining,
-            abs_delta_pct=abs(btc_delta_pct),
+            abs_delta_pct=abs(model_delta_pct),
             true_prob=candidate_true_prob,
             market_price=candidate_market_price,
             fee_adjusted_edge_value=net_edge,
@@ -602,7 +616,7 @@ class PolyBot:
         self.tracker.log_gate_tick(
             window_ts=self._current_window,
             btc_price=btc_price,
-            adjusted_btc_price=adjusted_btc_price,
+            signal_btc_price=signal_btc_price,
             opening_price=self._opening_price,
             up_price=up_price,
             down_price=down_price,
@@ -633,7 +647,7 @@ class PolyBot:
 
         # Store context for window-end no-trade signal logging
         self._last_tick_context = {
-            "btc_price": adjusted_btc_price,
+            "btc_price": signal_btc_price,
             "raw_btc_price": btc_price,
             "up_price": up_price,
             "down_price": down_price,
@@ -651,10 +665,10 @@ class PolyBot:
             self._dry_period_stats["signals"] += 1
             if source_decision.should_skip:
                 print(
-                    f"  ⚠️  Source disagreement — skipping ({source_decision.reason}; "
-                    f"basis={source_decision.basis_bps if source_decision.basis_bps is not None else 0:+.1f}bps, "
-                    f"mean={source_decision.basis_mean_bps:+.1f}bps, "
-                    f"ref_age={source_decision.reference_age_seconds if source_decision.reference_age_seconds is not None else -1:.1f}s)"
+                    f"  ⚠️  Source risk gate — skipping ({source_decision.reason}; "
+                    f"rtds_gap={source_decision.source_gap_bps if source_decision.source_gap_bps is not None else 0:+.1f}bps, "
+                    f"direct_vs_rtds={source_decision.direct_vs_rtds_binance_gap_bps if source_decision.direct_vs_rtds_binance_gap_bps is not None else 0:.1f}bps, "
+                    f"cl_age={source_decision.chainlink_age_seconds if source_decision.chainlink_age_seconds is not None else -1:.1f}s)"
                 )
                 self._log_source_skip(signal_result, seconds_remaining, source_decision, "skipped_source_disagreement")
                 self._trade_attempted = True
@@ -710,8 +724,16 @@ class PolyBot:
             return
 
         btc_delta_pct = ((btc_price - self._opening_price) / self._opening_price) * 100
+        chainlink_price = self.rtds_feed.get_latest()
+        chainlink_delta_pct = (
+            ((chainlink_price.price - self._chainlink_open_price) / self._chainlink_open_price) * 100
+            if chainlink_price and self._chainlink_open_price > 0
+            else None
+        )
+        # Held-side probability uses the same de-biased Binance move as entry.
+        model_delta_pct = btc_delta_pct
         our_prob = probability_for_held_side(
-            btc_delta_pct,
+            model_delta_pct,
             seconds_remaining,
             self._trade_side,
             vol=self._compute_realized_vol(),
@@ -722,9 +744,14 @@ class PolyBot:
             if now - self._last_status_print >= 30:
                 self._last_status_print = now
                 d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
+                ref_label = (
+                    f"CL {chainlink_delta_pct:+.3f}%/{chainlink_price.age_seconds:.1f}s"
+                    if chainlink_delta_pct is not None and chainlink_price
+                    else "CL n/a"
+                )
                 print(
                     f"  ⏱  T-{seconds_remaining:5.1f}s | "
-                    f"BTC {d}{abs(btc_delta_pct):.3f}% | "
+                    f"BN {d}{abs(btc_delta_pct):.3f}% | {ref_label} | "
                     f"Prob: {our_prob:.2f} | "
                     f"P&L ${self.stats.total_pnl:+.2f} [HOLDING→RES]"
                 )
@@ -758,10 +785,15 @@ class PolyBot:
 
         # Status line (monitoring only — no exits)
         d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
+        ref_label = (
+            f"CL {chainlink_delta_pct:+.3f}%/{chainlink_price.age_seconds:.1f}s"
+            if chainlink_delta_pct is not None and chainlink_price
+            else "CL n/a"
+        )
         pnl_emoji = "📈" if unrealized_pnl > 0 else "📉"
         print(
             f"  {pnl_emoji} T-{seconds_remaining:5.1f}s | "
-            f"BTC {d}{abs(btc_delta_pct):.3f}% | "
+            f"BN {d}{abs(btc_delta_pct):.3f}% | {ref_label} | "
             f"Prob: {our_prob:.2f} | "
             f"Sell: ${current_sell_price:.3f} | "
             f"PnL: ${unrealized_pnl:+.2f} ({return_pct:+.0%})"
@@ -789,15 +821,23 @@ class PolyBot:
                             print(f"  ✅ Phantom resolved: WIN +${profit:.2f} [phantom_resolved] | "
                                   f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
                             self.telegram.win_alert(profit, self.stats.total_pnl)
-                            btc_price, _ = self.price_feed.get_price()
+                            official = self._fetch_official_window_price(pp["window_ts"], retries=2, delay=0.5)
+                            official_open = float(official.open_price or 0.0) if official else 0.0
+                            official_close = float(official.close_price or 0.0) if official else 0.0
+                            final_price = official_close if official_close > 0 else 0.0
+                            final_open = official_open if official_open > 0 else pp["opening_price"]
                             self.tracker.log_trade_resolve(
-                                btc_final_price=btc_price,
-                                opening_price=pp["opening_price"],
+                                btc_final_price=final_price,
+                                opening_price=final_open,
                                 won=True,
                                 profit=profit,
                                 exit_revenue=pp["exit_revenue"],
                                 resolution_method="phantom_resolved",
                                 claim_result="phantom_resolved",
+                                final_price_source="polymarket_crypto_price" if official_close > 0 else "unknown",
+                                official_open_price=official_open,
+                                official_close_price=official_close,
+                                official_completed=bool(official.completed) if official else False,
                             )
                         else:
                             # Balance still hasn't moved — genuine loss
@@ -808,15 +848,23 @@ class PolyBot:
                             print(f"  ❌ Phantom confirmed: LOSS -${net_loss:.2f} [phantom_confirmed] | "
                                   f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
                             self.telegram.loss_alert(net_loss, self.stats.total_pnl)
-                            btc_price, _ = self.price_feed.get_price()
+                            official = self._fetch_official_window_price(pp["window_ts"], retries=2, delay=0.5)
+                            official_open = float(official.open_price or 0.0) if official else 0.0
+                            official_close = float(official.close_price or 0.0) if official else 0.0
+                            final_price = official_close if official_close > 0 else 0.0
+                            final_open = official_open if official_open > 0 else pp["opening_price"]
                             self.tracker.log_trade_resolve(
-                                btc_final_price=btc_price,
-                                opening_price=pp["opening_price"],
+                                btc_final_price=final_price,
+                                opening_price=final_open,
                                 won=False,
                                 profit=-net_loss,
                                 exit_revenue=pp["exit_revenue"],
                                 resolution_method="phantom_confirmed",
                                 claim_result="phantom_confirmed",
+                                final_price_source="polymarket_crypto_price" if official_close > 0 else "unknown",
+                                official_open_price=official_open,
+                                official_close_price=official_close,
+                                official_completed=bool(official.completed) if official else False,
                             )
                         self._pending_phantom = {}
                 else:
@@ -907,7 +955,10 @@ class PolyBot:
                     self._last_real_balance = real_bal
 
         self._current_window = window_ts
-        self._opening_price = 0.0
+        # Binance window-open = the boundary tick (price at the instant the window
+        # flipped). This is the de-biased anchor for all Binance-delta signals.
+        self._opening_price = float(closing_btc_price) if closing_btc_price and closing_btc_price > 0 else 0.0
+        self._chainlink_open_price = 0.0
         self._traded = False
         self._trade_attempted = False
         self._exit_revenue = 0.0
@@ -940,13 +991,13 @@ class PolyBot:
         if market:
             self._refresh_market_metadata_and_orderbook(market)
         if market and market.opening_price:
-            self._opening_price = market.opening_price
-            print(f"  📌 Polymarket openPrice: ${self._opening_price:,.2f}")
+            self._chainlink_open_price = market.opening_price
+            print(f"  📌 Polymarket/Chainlink openPrice: ${self._chainlink_open_price:,.2f}")
         else:
-            self._opening_price = 0.0
+            self._chainlink_open_price = 0.0
             self._window_open_price_missing = True
             if self.dry_run:
-                print("  ⚠️  Polymarket openPrice unavailable after retry — dry-run will fall back to first fresh Binance tick")
+                print("  ⚠️  Polymarket openPrice unavailable after retry — dry-run Chainlink source-consensus checks degraded")
             else:
                 self._trade_attempted = True
                 print("  ⚠️  Polymarket openPrice unavailable after retry — skipping LIVE trading for this window")
@@ -973,7 +1024,7 @@ class PolyBot:
 
         The crypto-price endpoint can lag the exact 5-minute boundary by several
         seconds. Live trading should not immediately substitute Binance's first
-        local tick for this reference price.
+        local tick for the official open price.
         """
         target_first_query_at = float(window_ts) + max(0.0, self._open_price_initial_delay)
         now = time.time()
@@ -1001,6 +1052,23 @@ class PolyBot:
 
             wait = max(0.1, min(self._open_price_retry_interval, deadline - now))
             time.sleep(wait)
+
+    def _fetch_official_window_price(self, window_ts: int, retries: int = 3, delay: float = 1.0):
+        """Fetch official Polymarket/Chainlink open/close for a resolved window."""
+        last = None
+        for attempt in range(max(1, retries)):
+            last = fetch_crypto_window_price("BTC", window_ts)
+            if last and last.open_price and last.close_price and last.completed:
+                return last
+            if attempt < retries - 1:
+                time.sleep(delay)
+        return last
+
+    @staticmethod
+    def _official_winning_side(official) -> str:
+        if not official or not official.open_price or not official.close_price or not official.completed:
+            return ""
+        return "UP" if official.close_price >= official.open_price else "DOWN"
 
     # ── Market prices (cached, complement engine) ───────────────────
 
@@ -1036,27 +1104,27 @@ class PolyBot:
             return max(self._vol_floor, min(self._vol_cap, vol))
         return self._vol_fallback
 
-    def _get_reference_price_for_window(self):
-        """Return latest Polymarket/Chainlink reference, with REST fallback.
+    def _get_chainlink_price_for_window(self):
+        """Return latest Polymarket/Chainlink, with REST fallback.
 
         The RTDS stream is the preferred live source. REST price-history is a
         coarse fallback so source-consensus decisions do not silently degrade to
         Binance-only logic.
         """
-        ref = self.reference_feed.get_latest()
+        ref = self.rtds_feed.get_latest()
         if ref and ref.age_seconds <= self._source_consensus_config.stale_downsize_seconds:
             return ref
         if self._current_window > 0:
             period_secs = PERIOD_SECONDS[self.period]
-            rest_ref = self.reference_feed.update_from_rest(
+            rest_chainlink = self.rtds_feed.update_from_rest(
                 self._current_window, self._current_window + period_secs
             )
-            if rest_ref:
-                return rest_ref
+            if rest_chainlink:
+                return rest_chainlink
         return ref
 
     def _log_source_skip(self, sig, seconds_remaining: float, decision, action: str):
-        btc_approx = decision.adjusted_price or (
+        btc_approx = decision.signal_price or (
             self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
         )
         self.tracker.log_signal(
@@ -1201,21 +1269,26 @@ class PolyBot:
         source_decision = self.source_consensus.assess_snapshot(sig.side)
         if source_decision.reason == "source_snapshot_missing":
             latest_btc, latest_fresh = self.price_feed.get_price()
-            latest_reference = self.reference_feed.get_latest()
+            latest_chainlink = self.rtds_feed.get_latest()
+            get_rtds_binance = getattr(self.rtds_feed, "get_binance_latest", None)
+            latest_rtds_binance = get_rtds_binance() if callable(get_rtds_binance) else None
             if latest_fresh and latest_btc > 0 and self._opening_price > 0:
                 source_decision = self.source_consensus.update_snapshot(
                     binance_price=latest_btc,
-                    opening_price=self._opening_price,
+                    opening_price=self._chainlink_open_price,
                     intended_side=sig.side,
-                    reference=latest_reference,
+                    chainlink=latest_chainlink,
+                    rtds_binance=latest_rtds_binance,
+                    binance_opening_price=self._opening_price,
                 )
         if source_decision.should_skip:
             print(
-                f"  ⚠️  Source snapshot disagreement before entry — skipping "
-                f"({source_decision.reason}; basis="
-                f"{source_decision.basis_bps if source_decision.basis_bps is not None else 0:+.1f}bps, "
-                f"median={source_decision.basis_mean_bps:+.1f}bps, "
-                f"ref_age={source_decision.reference_age_seconds if source_decision.reference_age_seconds is not None else -1:.1f}s)"
+                f"  ⚠️  Source risk gate before entry — skipping "
+                f"({source_decision.reason}; rtds_gap="
+                f"{source_decision.source_gap_bps if source_decision.source_gap_bps is not None else 0:+.1f}bps, "
+                f"direct_vs_rtds="
+                f"{source_decision.direct_vs_rtds_binance_gap_bps if source_decision.direct_vs_rtds_binance_gap_bps is not None else 0:.1f}bps, "
+                f"cl_age={source_decision.chainlink_age_seconds if source_decision.chainlink_age_seconds is not None else -1:.1f}s)"
             )
             self._log_source_skip(sig, seconds_remaining, source_decision, "skipped_source_disagreement")
             return
@@ -1424,9 +1497,10 @@ class PolyBot:
 
             latest_btc, latest_fresh = self.price_feed.get_price()
             if latest_fresh and self._opening_price > 0 and latest_btc > 0:
-                latest_adjusted_btc = latest_btc * (1.0 + self.source_consensus.basis_mean_bps / 10000.0)
-                latest_delta_pct = (latest_adjusted_btc - self._opening_price) / self._opening_price * 100
-                latest_side = "UP" if latest_adjusted_btc >= self._opening_price else "DOWN"
+                # Final hot-path recheck uses raw Binance only. Do not apply a
+                # Source risk is handled by SourceConsensusGate against RTDS Binance/Chainlink directly.
+                latest_delta_pct = (latest_btc - self._opening_price) / self._opening_price * 100
+                latest_side = "UP" if latest_btc >= self._opening_price else "DOWN"
                 recheck_vol = self._compute_realized_vol()
                 latest_our_prob = probability_for_held_side(
                     latest_delta_pct,
@@ -1438,7 +1512,7 @@ class PolyBot:
                     if latest_side != sig.side:
                         action = "skipped_btc_reversed"
                         skip_reason = "btc_reversed_before_entry"
-                        message = "Basis-adjusted BTC reversed before entry"
+                        message = "BTC reversed before entry"
                     else:
                         action = "skipped_prob_below_min"
                         skip_reason = "prob_below_min_at_final_recheck"
@@ -1451,7 +1525,7 @@ class PolyBot:
                     )
                     self.tracker.log_signal(
                         window_ts=self._current_window,
-                        btc_price=latest_adjusted_btc,
+                        btc_price=latest_btc,
                         opening_price=self._opening_price,
                         up_price=self._cached_up,
                         down_price=self._cached_down,
@@ -1616,8 +1690,26 @@ class PolyBot:
         original_cost = self._trade_cost
         remaining_shares = self._trade_shares
 
-        # ── Dry run: Binance price fallback ──────────────────────────
+        # ── Dry run: prefer official Polymarket/Chainlink close ───────
         if self.dry_run:
+            official = self._fetch_official_window_price(self._current_window, retries=2, delay=0.5)
+            official_side = self._official_winning_side(official)
+            if official_side:
+                won = official_side == self._trade_side
+                self._record_resolution(
+                    won=won,
+                    original_cost=original_cost,
+                    remaining_shares=remaining_shares,
+                    resolution_method="dry_official_chainlink",
+                    claim_revenue=0.0,
+                    final_price_source="polymarket_crypto_price",
+                    official=official,
+                )
+                return
+
+            # Fallback only when official data is unavailable/incomplete. Keep the
+            # method label explicit so calibration never confuses Binance with the
+            # settlement oracle.
             btc_price, _ = self.price_feed.get_price()
             if self._opening_price <= 0 or btc_price <= 0:
                 return
@@ -1626,8 +1718,10 @@ class PolyBot:
                 won=won,
                 original_cost=original_cost,
                 remaining_shares=remaining_shares,
-                resolution_method="dry_binance_fallback",
+                resolution_method="dry_binance_fallback_official_unavailable",
                 claim_revenue=0.0,
+                final_price_source="binance_fallback",
+                official=official,
             )
             return
 
@@ -1751,6 +1845,7 @@ class PolyBot:
     def _record_resolution(
         self, won: bool, original_cost: float, remaining_shares: float,
         resolution_method: str, claim_revenue: float, claim_result: str = "not_attempted",
+        final_price_source: str = "", official=None,
     ):
         """Apply win/loss to stats, print result, alert Telegram, log to tracker."""
         bankroll_before_resolution = self.stats.bankroll
@@ -1799,13 +1894,27 @@ class PolyBot:
                     self._dry_threshold_wins += 1
                     self._dry_period_stats["threshold_wins"] += 1
 
-        btc_price, _ = self.price_feed.get_price()
+        if official is None:
+            official = self._fetch_official_window_price(self._current_window, retries=2, delay=0.5)
+
+        official_open = float(official.open_price or 0.0) if official else 0.0
+        official_close = float(official.close_price or 0.0) if official else 0.0
+        official_completed = bool(official.completed) if official else False
+
+        binance_price, _ = self.price_feed.get_price()
+        final_price = official_close if official_close > 0 else binance_price
+        final_open = official_open if official_open > 0 else self._opening_price
+        if official_close > 0:
+            final_price_source = "polymarket_crypto_price"
+        elif not final_price_source:
+            final_price_source = "binance_reference_fallback_not_settlement"
+
         self._log_completed_dry_run_window(
-            won=won, simulated_profit=profit, final_price=btc_price
+            won=won, simulated_profit=profit, final_price=final_price
         )
         self.tracker.log_trade_resolve(
-            btc_final_price=btc_price,
-            opening_price=self._opening_price,
+            btc_final_price=final_price,
+            opening_price=final_open,
             won=won,
             profit=profit,
             # For LIVE claim sells, this is the actual collateral received at
@@ -1814,6 +1923,10 @@ class PolyBot:
             exit_revenue=self._exit_revenue + claim_revenue,
             resolution_method=resolution_method,
             claim_result=claim_result,
+            final_price_source=final_price_source,
+            official_open_price=official_open,
+            official_close_price=official_close,
+            official_completed=official_completed,
         )
 
     # ── Hourly + shutdown ───────────────────────────────────────────
@@ -1894,7 +2007,7 @@ class PolyBot:
         print(f"\n\n🛑 Shutting down...")
         self._running = False
         self.price_feed.stop()
-        self.reference_feed.stop()
+        self.rtds_feed.stop()
         if self.executor._initialized:
             self.executor.cancel_all()
 
