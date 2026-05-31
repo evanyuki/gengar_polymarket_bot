@@ -1,7 +1,12 @@
 .env
+.env.*
+*.env.bak
+.env.bak_*
 __pycache__/
 *.pyc
 .pytest_cache/
 logs/
 venv/
 .venv/
+.playwright-mcp/
+*.png
