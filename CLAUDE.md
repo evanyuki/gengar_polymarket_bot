@@ -50,22 +50,21 @@ Every 5 minutes, Polymarket opens a market: "Will BTC be higher or lower?" Share
    - Volatility parameter: `btc_5min_vol = 0.12` (recalibrated — was 0.08, see calibration section)
    - Output: probability that BTC will be above/below opening price at resolution
 
-2. **Minimum probability gate**: `min_prob = 0.80` — model must be 80%+ confident
+2. **Minimum probability gate**: live `MIN_PROB=0.86` (code default 0.80) — model must clear that confidence
 
-3. **Margin of safety**: `market_price ≤ true_prob × safety_factor` where `safety_factor = 0.85`
-   - Borrowed from Noisy's article on Polymarket ML trading
-   - Even if model is 15% wrong, we break even
-   - Was 0.70 initially — too aggressive for 5-min markets, no trades fired. Raised to 0.85.
+3. **Fee-adjusted edge gate**: `fee_adjusted_edge(true_prob, market_price, fee) ≥ ENTRY_HUGE_EDGE_MIN`
+   - Live `ENTRY_HUGE_EDGE_MIN=0.08` (code default 0.18); `MIN_EDGE=0.06` is the net-edge floor.
+   - The old `safety_factor` / `market_price ≤ true_prob × 0.85` mechanism was REMOVED. There is no `safety_factor` in the code. Entry is gated directly on fee-adjusted net edge, not a price-vs-prob ratio.
 
 ### Position sizing and execution
 
 Quarter-Kelly criterion. `kelly_f = (b*p - q) / b` where `b = (1-price)/price`. Then `bet = bankroll × kelly_f × 0.25`. Bounded by configured `MIN_BET`/`MAX_BET`. CLOB `minimum_order_size` is shares (BTC 5m commonly 5 shares), not a fixed $5 notional; for FAK BUY market orders the bot ensures the dollar amount can buy at least `mos` shares at the worst-price cap.
 
-Execution policy is intentionally narrow: huge-edge FAK taker only. Default `ENTRY_HUGE_EDGE_MIN=0.15`; signals with lower fee-adjusted edge are skipped. GTD/post-only maker entry was removed because it conflicts with the oracle-lag thesis: if the edge is real and large, immediate execution is worth more than maker fee savings; if the edge is not large, do not trade.
+Execution policy is intentionally narrow: huge-edge FAK taker only. Live `ENTRY_HUGE_EDGE_MIN=0.08` (code default 0.18); signals with lower fee-adjusted edge are skipped. GTD/post-only maker entry was removed because it conflicts with the oracle-lag thesis: if the edge is real and large, immediate execution is worth more than maker fee savings; if the edge is not large, do not trade.
 
 ### Exit: hold to resolution
 
-Default and intended policy is hold-to-resolution. `STOP_LOSS_ENABLED` defaults to `false`; stop-loss/prob-stop code is not used in the live position manager. Sell prices and held-side Brownian probability are monitored for diagnostics/calibration only. Older analysis showed stops can destroy value in this market because BTC micro-bounces can trigger exits that later resolve correctly.
+Default and intended policy is hold-to-resolution. This is hardcoded — there is NO env toggle (`STOP_LOSS_ENABLED` is not read by any code; do not document it as live config). Stop-loss/prob-stop code is not used in the live position manager. Sell prices and held-side Brownian probability are monitored for diagnostics/calibration only. Older analysis showed stops can destroy value in this market because BTC micro-bounces can trigger exits that later resolve correctly.
 
 For LIVE resolution, Binance is not final truth. Reconcile using Polymarket claim/order result, official outcome/CSV, and collateral balance. Binance final price is logged only as diagnostic context or dry-run simulation fallback.
 
@@ -133,7 +132,7 @@ Balance API returns 6 decimals (1e6). Conditional tokens are ERC-1155 requiring 
 
 ### VPN/geo restrictions
 
-CLOB API blocks POST `/order` from datacenter/VPN IPs. Resolved by routing through Tor (`proxy.py`). If Tor exit node gets blocked, restart Tor for a new circuit. Don't try to fix with header patching — it doesn't work.
+Tor is NOT required for placement. POST `/order` from the Hostinger MY VPS returns 401 (auth), not 403 (geo) — direct placement works. Tor (`proxy.py`) is now a lazy fallback: `executor.py` imports `ensure_tor`/`apply_proxy` only on a 403. If a real geo-block (403) appears, the proxy patch activates; restart Tor for a new circuit if its exit node is blocked. Header patching does not bypass a 403 — don't try.
 
 ### Order verification timing
 
@@ -191,22 +190,42 @@ PRIVATE_KEY=0x...
 SAFE_ADDRESS=0x...
 DRY_RUN=false
 
-# Strategy
-MIN_EDGE=0.05
-MIN_PROB=0.80
-ENTRY_HUGE_EDGE_MIN=0.15
-ENTRY_WINDOW_START=240
+# Strategy (live values — .env is source of truth, not code defaults)
+MIN_EDGE=0.06
+MIN_PROB=0.86
+ENTRY_HUGE_EDGE_MIN=0.08
+ENTRY_WINDOW_START=210
 ENTRY_WINDOW_END=10
 KELLY_FRACTION=0.25
-MIN_BET=5.0
-MAX_BET=25.0
-BANKROLL=100.0
-
-# Exit policy
-STOP_LOSS_ENABLED=false
+MIN_BET=1.0
+MAX_BET=5.0
+BANKROLL=20.0
 
 # Safety
-DAILY_LOSS_LIMIT=30
+DAILY_LOSS_LIMIT=10
+
+# Cold-start gating (new — block trading until buffers hold real measurements)
+ENTRY_REQUIRE_WARM=true
+SEED_VOL_FROM_KLINES=true
+WARM_MIN_SAMPLES=12
+WARM_MIN_SPAN_S=30
+
+# Source consensus (settlement = Chainlink; Binance is signal only)
+SOURCE_CONSENSUS_ENABLED=true
+SOURCE_REQUIRE_CHAINLINK=true
+SOURCE_REQUIRE_RTDS_BINANCE=true
+SOURCE_STALE_DOWNSIZE_SEC=10.0
+SOURCE_STALE_SKIP_SEC=30.0
+SOURCE_DOWNSIZE_FACTOR=0.50
+SOURCE_RTDS_SOURCE_GAP_BPS=25.0
+SOURCE_DIRECT_VS_RTDS_BINANCE_GAP_BPS=6.0
+
+# Entry execution
+ENTRY_FAK_SLIPPAGE_TICKS=1
+ENTRY_MAX_SPREAD=0.08
+ENTRY_MIN_EXIT_PRICE=0.50
+CLOB_ORDERBOOK_CACHE_ENABLED=true
+CLOB_ORDERBOOK_MAX_AGE_SEC=1.0
 
 # Notifications
 TELEGRAM_BOT_TOKEN=...
@@ -216,6 +235,8 @@ TELEGRAM_CHAT_ID=...
 MARKET_PERIOD=5
 LOG_DIR=logs
 ```
+
+> Exit policy is hardcoded hold-to-resolution. There is NO `STOP_LOSS_ENABLED` env var (it was documented but never read by code).
 
 ---
 
