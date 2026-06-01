@@ -105,6 +105,27 @@ class MarkovPersistenceFilter:
     def passes(self, direction: Direction, threshold: float = 0.87) -> bool:
         return self.persistence(direction) >= threshold
 
+    def is_warm(
+        self,
+        min_samples: int = 12,
+        min_span_seconds: float = 30.0,
+        now: Optional[float] = None,
+    ) -> bool:
+        """True when the buffer holds enough recent ticks for momentum and
+        persistence to be real measurements rather than cold-start zeros.
+
+        price_change_pct() returns 0.0 when fewer than 2 samples exist, and a
+        meaningful 30s/15s momentum needs a base sample at least that old. A
+        flaky/reconnecting feed leaves the buffer sparse, so an entry can look
+        momentum-neutral only because nothing was measured. Gate on buffer
+        CONTENT (count + time span actually held), not elapsed wall time, so a
+        gappy feed stays blocked until it genuinely catches up.
+        """
+        if len(self._samples) < min_samples:
+            return False
+        span = self._samples[-1][0] - self._samples[0][0]
+        return span >= min_span_seconds
+
     def _trim(self, now: float) -> None:
         cutoff = now - self.lookback_seconds
         while self._samples and self._samples[0][0] < cutoff:

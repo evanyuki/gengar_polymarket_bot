@@ -10,19 +10,11 @@ from __future__ import annotations
 import json
 import threading
 import time
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Optional
 
 
-POLYMARKET_WEB_API = "https://polymarket.com/api"
 POLYMARKET_RTDS_WS = "wss://ws-live-data.polymarket.com"
-
-
-def iso_utc(ts: int) -> str:
-    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 @dataclass
@@ -52,6 +44,16 @@ class SourceConsensusConfig:
     # Chainlink is already on the intended side and far enough from open to
     # avoid the near-zero coin-flip zone.
     min_chainlink_delta_pct: float = 0.02
+    # Binance trades structurally ~14.5bps above Chainlink — a near-constant
+    # basis, NOT lag. The raw source_gap therefore rests near +basis, which made
+    # the lag-direction test flag EVERY DOWN signal as "adverse" (gap>0) and
+    # EVERY UP as "aligned", firing a downsize on every DOWN for no real reason.
+    # De-bias the gap by the basis so the lag test measures only the EXCESS
+    # lead (true lag), and tolerate a deadband so it bites only on genuinely
+    # anomalous lag. This de-biases a diagnostic heuristic; it does NOT
+    # fabricate a settlement price (see module header warning).
+    binance_chainlink_basis_bps: float = 14.5
+    lag_adverse_deadband_bps: float = 5.0
 
 
 @dataclass
@@ -111,41 +113,6 @@ class PolymarketRtdsFeed:
         if max_age is not None and age > max_age:
             return None
         return RtdsPrice(latest.price, latest.source, latest.timestamp, age)
-
-    def update_from_rest(self, window_ts: int, window_end_ts: int) -> Optional[RtdsPrice]:
-        """Coarse Chainlink fallback from Polymarket price-history."""
-        try:
-            params = urllib.parse.urlencode(
-                {
-                    "symbol": self.symbol,
-                    "eventStartTime": iso_utc(window_ts),
-                    "variant": "fiveminute",
-                    "endDate": iso_utc(window_end_ts),
-                }
-            )
-            url = f"{POLYMARKET_WEB_API}/crypto/price-history?{params}"
-            req = urllib.request.Request(url, headers={"User-Agent": "PolyBot/1.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode())
-            if not isinstance(data, list) or not data:
-                return None
-            last = data[-1]
-            price = float(last.get("value", 0.0))
-            ts_ms = int(last.get("timestamp", 0))
-            if price <= 0 or ts_ms <= 0:
-                return None
-            ref = RtdsPrice(
-                price=price,
-                source="polymarket_price_history_fallback",
-                timestamp=ts_ms / 1000.0,
-                age_seconds=max(0.0, time.time() - (ts_ms / 1000.0)),
-            )
-            with self._lock:
-                if self._latest_chainlink is None or ref.timestamp >= self._latest_chainlink.timestamp:
-                    self._latest_chainlink = ref
-            return ref
-        except Exception:
-            return None
 
     def _set_latest(self, price: float, timestamp_ms: int, source: str) -> None:
         if price <= 0 or timestamp_ms <= 0:
@@ -365,8 +332,13 @@ class SourceConsensusGate:
         if abs(source_gap) > self.config.max_rtds_source_gap_bps:
             return self._decision("skip", "rtds_binance_chainlink_gap_too_large", 0.0, signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
 
+        # De-bias the constant Binance/Chainlink basis out of the lag test so it
+        # measures only the EXCESS lead, then tolerate a deadband so it downsizes
+        # only on genuinely anomalous lag, not the resting basis. Raw source_gap
+        # is kept for the abnormal-split guard above and for logging.
         expected_lag_sign = 1.0 if intended_side == "UP" else -1.0
-        lag_aligned = (source_gap * expected_lag_sign) >= 0.0
+        lag_excess_bps = source_gap - self.config.binance_chainlink_basis_bps
+        lag_aligned = (lag_excess_bps * expected_lag_sign) >= -self.config.lag_adverse_deadband_bps
 
         if chainlink.age_seconds > self.config.stale_downsize_seconds:
             return self._decision("downsize", "polymarket_chainlink_mildly_stale", self.config.downsize_factor, signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)

@@ -90,19 +90,6 @@ def _is_tor_running() -> bool:
         return False
 
 
-def _stop_tor() -> None:
-    """Stop our managed Tor instance if running."""
-    if not TOR_PID_FILE.exists():
-        return
-    try:
-        pid = int(TOR_PID_FILE.read_text().strip())
-        os.kill(pid, signal.SIGTERM)
-        logger.info(f"Stopped Tor (pid {pid})")
-    except (ValueError, ProcessLookupError, PermissionError):
-        pass
-    TOR_PID_FILE.unlink(missing_ok=True)
-
-
 _BOOTSTRAP_TIMEOUT = 120  # seconds to wait for Tor to reach 100% bootstrap
 
 

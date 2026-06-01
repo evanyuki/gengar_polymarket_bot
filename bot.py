@@ -195,6 +195,20 @@ class PolyBot:
             tick_threshold_pct=float(os.getenv("MARKOV_TICK_THRESHOLD_PCT", "0.005")),
             min_transitions=int(os.getenv("MARKOV_MIN_TRANSITIONS", "8")),
         )
+        # Cold-start warmup gate. Backtest (logs/gate_ticks.csv): entries taken
+        # while realized_vol was the 0.12 fallback (< warm windows) AND/OR the
+        # markov buffer was cold scored WR 54.5% / -$5.49 over n=11; warm-buffer
+        # entries scored 92.1% / +$34.56 over n=38. Block entries until both the
+        # tick buffer (momentum/persistence) and the window-delta buffer
+        # (realized_vol) are real measurements, not session-start defaults.
+        self._entry_require_warm: bool = os.getenv("ENTRY_REQUIRE_WARM", "true").lower() == "true"
+        self._warm_min_samples: int = int(os.getenv("WARM_MIN_SAMPLES", "12"))
+        self._warm_min_span_s: float = float(os.getenv("WARM_MIN_SPAN_S", "30"))
+        # Warm-start realized_vol from Binance recent klines so the vol gate
+        # opens on window 1 instead of idling ~30 min (6 live windows). Verified:
+        # GET /api/v3/klines index1=open index4=close, weight 2, 5m candles share
+        # the bot's wall-clock UTC 5-min grid (openTime%300==0). Fails soft.
+        self._seed_vol_enabled: bool = os.getenv("SEED_VOL_FROM_KLINES", "true").lower() == "true"
         self._current_fee_rate_bps: float = 0.0
         self._cached_up_fee_bps: float = 0.0
         self._cached_down_fee_bps: float = 0.0
@@ -223,6 +237,8 @@ class PolyBot:
             max_rtds_source_gap_bps=float(os.getenv("SOURCE_RTDS_SOURCE_GAP_BPS", "25.0")),
             max_direct_vs_rtds_binance_gap_bps=float(os.getenv("SOURCE_DIRECT_VS_RTDS_BINANCE_GAP_BPS", "6.0")),
             min_chainlink_delta_pct=float(os.getenv("CHAINLINK_MIN_DELTA_PCT", "0.02")),
+            binance_chainlink_basis_bps=float(os.getenv("SOURCE_BINANCE_CHAINLINK_BASIS_BPS", "14.5")),
+            lag_adverse_deadband_bps=float(os.getenv("SOURCE_LAG_ADVERSE_DEADBAND_BPS", "5.0")),
         )
         self.source_consensus = SourceConsensusGate(self._source_consensus_config)
         self._orderbook_cache_enabled: bool = os.getenv("CLOB_ORDERBOOK_CACHE_ENABLED", "true").lower() == "true"
@@ -323,14 +339,18 @@ class PolyBot:
         self._daily_loss_halted: bool = False
 
     def start(self):
+        import logging as _log
+        _log.basicConfig(level=_log.INFO, format="[%(name)s] %(message)s")
         if not self.dry_run:
-            from proxy import ensure_tor, apply_proxy
-            import logging as _log
-            _log.basicConfig(level=_log.INFO, format="[%(name)s] %(message)s")
-            print("\n🧅 Starting Tor proxy for CLOB API...")
-            proxy_url = ensure_tor()
-            apply_proxy(proxy_url)
-            print(f"✅ Tor active: {proxy_url}\n")
+            # P0 (direct-default): CLOB order placement reaches the app layer
+            # directly from this host — verified POST /order -> HTTP 401 (auth),
+            # NOT 403 (Cloudflare). Direct cuts the order round-trip from
+            # ~400-4900ms (Tor) to ~190ms, the root cause of the FAK no-fill /
+            # price-walk losses seen in live logs. Tor is NOT started here; it is
+            # lazily activated by executor._activate_tor_fallback() only if a
+            # live order ever returns HTTP 403.
+            print("\n🌐 CLOB direct connection (no Tor). "
+                  "Tor = lazy fallback on CF 403.\n")
 
         kf = self.strategy_config.kelly_fraction
         mp = self.strategy_config.min_prob
@@ -394,6 +414,8 @@ class PolyBot:
             print("❌ No price feed. Check internet.")
             return
         print(f"✅ BTC: ${price:,.2f} ({self.price_feed.state.source})")
+
+        self._seed_vol_from_klines()
 
         self.telegram.startup_alert({
             "dry_run": self.dry_run,
@@ -663,6 +685,16 @@ class PolyBot:
             self._window_signals_detected += 1
             self._dry_overall_signals += 1
             self._dry_period_stats["signals"] += 1
+            if self._entry_require_warm:
+                warm, warm_reason = self._buffers_warm(now)
+                if not warm:
+                    print(f"  🧊 Buffers warming ({warm_reason}) — skip entry "
+                          f"(samples={len(self._markov_filter._samples)}, "
+                          f"vol_windows={len(self._recent_window_deltas)})")
+                    self._log_source_skip(signal_result, seconds_remaining, source_decision, warm_reason)
+                    # Do NOT set _trade_attempted: re-evaluate next tick so we can
+                    # enter the moment buffers warm within the entry window.
+                    return
             if source_decision.should_skip:
                 print(
                     f"  ⚠️  Source risk gate — skipping ({source_decision.reason}; "
@@ -1091,6 +1123,66 @@ class PolyBot:
         except Exception as e:
             print(f"[market] Metadata/orderbook setup failed: {sanitize_exception_text(e)}")
 
+    def _seed_vol_from_klines(self) -> None:
+        """Warm-start realized_vol from Binance recent klines.
+
+        Each candle's abs((close-open)/open*100) is the EXACT statistic the live
+        path appends at window close (see `closing_delta`). Binance klines share
+        the bot's wall-clock 5-min UTC boundaries (openTime % period == 0), so
+        the seed is the same measurement observed early, letting the vol gate
+        open on window 1 instead of idling ~30 min for 6 live windows.
+
+        Fails soft: on any error the buffer stays empty and the warmup gate
+        still guards entry. Drops the last (in-progress, unsettled) candle.
+        """
+        if not self._seed_vol_enabled or self._recent_window_deltas:
+            return
+        import json as _json
+        import urllib.request as _url
+        interval = {1: "1m", 3: "3m", 5: "5m", 15: "15m", 30: "30m"}.get(self.period, "5m")
+        n = self._rolling_vol_windows
+        endpoint = (
+            "https://api.binance.com/api/v3/klines?symbol=BTCUSDT"
+            f"&interval={interval}&limit={n + 1}"
+        )
+        min_needed = max(6, self._rolling_vol_windows // 2)
+        try:
+            with _url.urlopen(endpoint, timeout=5) as resp:
+                raw = _json.load(resp)
+            deltas = []
+            for k in raw[:-1]:  # drop in-progress last candle
+                o, c = float(k[1]), float(k[4])
+                if o > 0:
+                    deltas.append(abs((c - o) / o * 100.0))
+            deltas = deltas[-n:]
+            if len(deltas) >= min_needed:
+                self._recent_window_deltas = deltas
+                print(f"  🔥 Vol seeded from {len(deltas)} Binance {interval} klines "
+                      f"→ realized_vol={self._compute_realized_vol():.4f} (vol gate open at window 1)")
+            else:
+                print(f"  ⚠️  Vol seed: only {len(deltas)} usable candles "
+                      f"(<{min_needed}); cold start + warmup gate active")
+        except Exception as e:
+            print(f"  ⚠️  Vol seed failed ({e}); cold start + warmup gate active")
+
+    def _buffers_warm(self, now: float = None) -> tuple[bool, str]:
+        """Both cold-start buffers ready? Returns (warm, reason_if_cold).
+
+        markov tick buffer -> momentum/persistence are real (not 0.0 zeros).
+        window-delta buffer -> realized_vol is measured, not the 0.12 fallback
+        that mis-selects mean-reverting outlier spikes (see backtest).
+        """
+        if not self._markov_filter.is_warm(
+            min_samples=self._warm_min_samples,
+            min_span_seconds=self._warm_min_span_s,
+            now=now,
+        ):
+            return False, "markov_warming_up"
+        min_vol_windows = max(6, self._rolling_vol_windows // 2)
+        if len(self._recent_window_deltas) < min_vol_windows:
+            return False, "vol_warming_up"
+        return True, ""
+
     def _compute_realized_vol(self) -> float:
         """Rolling std dev of recent window closing deltas.
 
@@ -1103,25 +1195,6 @@ class PolyBot:
             vol = statistics.stdev(self._recent_window_deltas)
             return max(self._vol_floor, min(self._vol_cap, vol))
         return self._vol_fallback
-
-    def _get_chainlink_price_for_window(self):
-        """Return latest Polymarket/Chainlink, with REST fallback.
-
-        The RTDS stream is the preferred live source. REST price-history is a
-        coarse fallback so source-consensus decisions do not silently degrade to
-        Binance-only logic.
-        """
-        ref = self.rtds_feed.get_latest()
-        if ref and ref.age_seconds <= self._source_consensus_config.stale_downsize_seconds:
-            return ref
-        if self._current_window > 0:
-            period_secs = PERIOD_SECONDS[self.period]
-            rest_chainlink = self.rtds_feed.update_from_rest(
-                self._current_window, self._current_window + period_secs
-            )
-            if rest_chainlink:
-                return rest_chainlink
-        return ref
 
     def _log_source_skip(self, sig, seconds_remaining: float, decision, action: str):
         btc_approx = decision.signal_price or (
@@ -1583,7 +1656,17 @@ class PolyBot:
 
             hint_price = price_cap
 
-        result = self.executor.buy(token_id=token_id, amount_usd=trade_amount, price=hint_price)
+        # Option A forensics anchor: wall-time just before submit, so a no-fill
+        # can report book-read -> order-land latency separately from book age.
+        t_fak_submit = time.time()
+        # Pass the window-open on-chain balance as a hint so executor.buy() skips
+        # its ~250ms pre-signing balance GET (no position open yet this window →
+        # hint == real balance). Falls back to a live fetch when <=0.
+        balance_hint = self._last_real_balance if self._last_real_balance > 0 else self.stats.bankroll
+        result = self.executor.buy(
+            token_id=token_id, amount_usd=trade_amount, price=hint_price,
+            balance_hint=balance_hint,
+        )
 
         if result.success:
             self._consecutive_buy_failures = 0  # Reset circuit breaker
@@ -1673,6 +1756,14 @@ class PolyBot:
                 print(f"  ⏳ Buy sent but unverified — will detect via balance sync")
             else:
                 print(f"  ❌ Buy failed: {result.error}")
+                # Option A: on FAK no-fill, immediately re-read the book to learn
+                # WHERE the ask went (race vs walk vs vanished). Decides whether a
+                # wider FAK cap (option B) would help or is futile (adverse pull).
+                if (result.error == "fak_no_fill_liquidity_gone"
+                        and self._orderbook_cache_enabled):
+                    self._fak_no_fill_forensics(
+                        token_id, hint_price, depth_snapshot, t_fak_submit
+                    )
                 # Circuit breaker: track consecutive API failures
                 err = str(result.error).lower()
                 if "request exception" in err or "service not ready" in err or "status_code=none" in err:
@@ -1683,6 +1774,85 @@ class PolyBot:
                                f"consecutive API failures — stopping trades until restart")
                         print(f"\n  {msg}")
                         self.telegram.status_update({"alert": msg})
+
+    # ── Option A: FAK no-fill forensics ─────────────────────────────
+
+    def _fak_no_fill_forensics(self, token_id, price_cap, pre_snapshot, t_submit):
+        """After a FAK no-fill, immediately re-read the book to learn WHERE the
+        ask went. Three causes look identical in the live log but need different
+        fixes:
+          RACE      — depth still sits at/below the old cap → pure timing; the
+                      ask was there, the order just lost the race (latency).
+          WALK_<=Nt — ask walked up <=N ticks → cap was too tight; a wider FAK
+                      slippage cap (option B) would have filled.
+          VANISHED  — no ask within +N ticks → MMs pulled on the same oracle
+                      (adverse selection); paying up only buys a worse fill.
+        Writes one row to logs/fak_no_fill_forensics.csv for post-run analysis.
+        """
+        try:
+            tick = self._market_tick_size if self._market_tick_size > 0 else 0.01
+            req = pre_snapshot.required_shares if pre_snapshot else 0.0
+            if not req or req <= 0:
+                req = float(self._market_min_order_size)
+            span_ticks = 5
+            wide_cap = round(price_cap + span_ticks * tick, 6)
+            post = self.orderbook_cache.get_buy_depth_snapshot(
+                token_id, required_shares=req, cap_price=price_cap
+            )
+            post_wide = self.orderbook_cache.get_buy_depth_snapshot(
+                token_id, required_shares=req, cap_price=wide_cap
+            )
+            elapsed_ms = (time.time() - t_submit) * 1000.0 if t_submit else 0.0
+            pre_ask = pre_snapshot.best_ask if pre_snapshot else 0.0
+            post_ask = post.best_ask
+            walk_ticks = (
+                round((post_ask - pre_ask) / tick)
+                if (pre_ask > 0 and post_ask > 0) else 0
+            )
+            if post.cumulative_shares + 1e-9 >= req:
+                cause = "RACE"
+            elif post_wide.cumulative_shares + 1e-9 >= req:
+                cause = f"WALK_<={span_ticks}t"
+            else:
+                cause = "VANISHED"
+            print(
+                f"  🔬 no-fill forensics [{cause}]: elapsed {elapsed_ms:.0f}ms | "
+                f"ask {pre_ask:.3f}→{post_ask:.3f} ({walk_ticks:+d}t) | "
+                f"post depth≤cap {post.cumulative_shares:.0f} | "
+                f"≤cap+{span_ticks}t {post_wide.cumulative_shares:.0f} | "
+                f"req {req:.0f} | post age {post.book_age_ms:.0f}ms"
+            )
+            self._append_no_fill_forensics_row(
+                token_id=token_id, cause=cause, elapsed_ms=round(elapsed_ms, 1),
+                price_cap=price_cap, wide_cap=wide_cap,
+                pre_ask=pre_ask, post_ask=round(post_ask, 6), walk_ticks=walk_ticks,
+                pre_depth=(round(pre_snapshot.cumulative_shares, 2) if pre_snapshot else 0.0),
+                pre_age_ms=(round(pre_snapshot.book_age_ms, 1) if pre_snapshot else 0.0),
+                post_depth_at_cap=round(post.cumulative_shares, 2),
+                post_depth_wide=round(post_wide.cumulative_shares, 2),
+                req=req, post_age_ms=round(post.book_age_ms, 1),
+            )
+        except Exception as e:
+            print(f"  🔬 no-fill forensics failed: {sanitize_exception_text(e)}")
+
+    def _append_no_fill_forensics_row(self, **row):
+        header = [
+            "window_ts", "token_id", "cause", "elapsed_ms", "price_cap",
+            "wide_cap", "pre_ask", "post_ask", "walk_ticks", "pre_depth",
+            "pre_age_ms", "post_depth_at_cap", "post_depth_wide", "req",
+            "post_age_ms",
+        ]
+        try:
+            log_dir = getattr(self.tracker, "log_dir", "logs")
+            path = os.path.join(log_dir, "fak_no_fill_forensics.csv")
+            row = {"window_ts": self._current_window, **row}
+            exists = os.path.exists(path)
+            with open(path, "a", encoding="utf-8") as f:
+                if not exists:
+                    f.write(",".join(header) + "\n")
+                f.write(",".join(str(row.get(k, "")) for k in header) + "\n")
+        except Exception as e:
+            print(f"  🔬 forensics CSV write failed: {sanitize_exception_text(e)}")
 
     # ── Resolve hold-to-resolution trade ────────────────────────────
 

@@ -103,6 +103,23 @@ def _is_fak_no_fill_error(exc: Exception) -> bool:
     )
 
 
+def _is_geoblock_403(exc: Exception) -> bool:
+    """Detect a Cloudflare/geoblock HTTP 403 on the CLOB order endpoint.
+
+    Direct datacenter-IP placement normally returns 401 (auth) or 400 (FAK);
+    a 403 means Cloudflare's bot/geo heuristic blocked the request, which is the
+    only failure mode where routing through Tor actually helps. We do NOT treat
+    401/400 as a Tor trigger.
+    """
+    text = str(exc).lower()
+    return (
+        "status_code=403" in text
+        or "403 forbidden" in text
+        or ("403" in text and "forbidden" in text)
+        or "cloudflare" in text
+    )
+
+
 class Executor:
     def __init__(self, private_key: str, safe_address: str = "", dry_run: bool = True):
         self.dry_run = dry_run
@@ -113,6 +130,7 @@ class Executor:
         self.min_order_size = POLY_MIN_NOTIONAL
         self.tick_size = 0.01
         self.fee_rate_bps = 0.0
+        self._tor_active = False
 
     def initialize(self) -> bool:
         try:
@@ -133,6 +151,34 @@ class Executor:
             return True
         except Exception as e:
             print(f"[executor] Init failed: {sanitize_exception_text(e)}")
+            return False
+
+    def _activate_tor_fallback(self) -> bool:
+        """Lazily start Tor and re-route the CLOB client through it.
+
+        Called ONLY when a live order returns HTTP 403 (Cloudflare/geo block).
+        The proxy patch (proxy.apply_proxy) only affects httpx.Client instances
+        created AFTER it runs, so we must rebuild the ClobClient afterwards for
+        its internal session to use the SOCKS5 proxy. Idempotent: once active,
+        the session stays on Tor (no flapping back to direct).
+        """
+        if self._tor_active:
+            return True
+        try:
+            from proxy import ensure_tor, apply_proxy
+            print("  🧅 CF 403 on order — activating Tor fallback "
+                  "(first time ~60s bootstrap)...")
+            proxy_url = ensure_tor()
+            apply_proxy(proxy_url)
+            # Rebuild the client so its httpx session picks up the proxy patch.
+            if not self.initialize():
+                print("  ❌ Tor fallback: CLOB client re-init failed")
+                return False
+            self._tor_active = True
+            print(f"  ✅ Tor fallback active: {proxy_url}")
+            return True
+        except Exception as e:
+            print(f"  ❌ Tor fallback failed: {sanitize_exception_text(e)}")
             return False
 
     def get_collateral_balance(self) -> float:
@@ -220,11 +266,17 @@ class Executor:
             print(f"[executor] Fee metadata check failed: {sanitize_exception_text(e)}")
             return 0.0
 
-    def buy(self, token_id: str, amount_usd: float, price: float = 0.0) -> OrderResult:
+    def buy(self, token_id: str, amount_usd: float, price: float = 0.0,
+            balance_hint: float = -1.0) -> OrderResult:
         """Buy with a marketable FAK limit order and explicit worst-price cap.
 
         This avoids BUY MarketOrderArgsV2(amount=USD), whose internal
         amount/price division can produce invalid share precision.
+
+        balance_hint: caller-supplied collateral balance to skip the hot-path
+        get_collateral_balance() CLOB GET (~250ms) before signing. Pass the
+        window-open on-chain balance — accurate because no position opens until
+        this buy. When <=0, a live balance is fetched (cold start / safety).
         """
         amount_usd = round(float(amount_usd), 2)
         if amount_usd < MIN_AMOUNT_USD:
@@ -284,7 +336,17 @@ class Executor:
         print(f"  📊 Market price: ${market_price:.3f}/share "
               f"→ {int(shares)} shares for ${planned_spend:.2f}")
 
-        balance_before = self.get_collateral_balance()
+        # Hot-path latency: get_collateral_balance() is a fresh ~250ms CLOB GET
+        # on every order, in series before signing. With a caller hint (window-
+        # open on-chain balance) we skip it, cutting book-read -> order-land
+        # latency ~in half so the ask walks less before our FAK lands. The hint
+        # is the window high-water balance (>= actual at submit, since balance
+        # only drops on this buy), so the SDK fee-buffer never over-shrinks; the
+        # post-order verify + window-boundary sync remain the source of truth.
+        if balance_hint > 0:
+            balance_before = balance_hint
+        else:
+            balance_before = self.get_collateral_balance()
 
         try:
             clob_order_type = OrderType.FAK
@@ -295,8 +357,19 @@ class Executor:
                 side="BUY",
                 user_usdc_balance=balance_before,
             )
-            signed_order = self.client.create_order(order_args)
-            result = self.client.post_order(signed_order, clob_order_type, False)
+            try:
+                signed_order = self.client.create_order(order_args)
+                result = self.client.post_order(signed_order, clob_order_type, False)
+            except Exception as post_exc:
+                # Direct placement blocked by Cloudflare (403) — activate Tor
+                # for THIS order and re-submit once. Any other error (incl. FAK
+                # no-fill 400) falls through to the outer handler unchanged.
+                if _is_geoblock_403(post_exc) and self._activate_tor_fallback():
+                    print("  🔁 Re-submitting this order via Tor (CF 403)...")
+                    signed_order = self.client.create_order(order_args)
+                    result = self.client.post_order(signed_order, clob_order_type, False)
+                else:
+                    raise
 
             order_id = result.get("orderID", "")
             if not order_id:
