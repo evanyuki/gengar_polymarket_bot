@@ -58,6 +58,15 @@ class StrategyConfig:
     markov_insufficient_size_multiplier: float = 0.25
     high_price_edge_buffer_threshold: float = 0.80
     high_price_min_edge: float = 0.08
+    # Momentum-confirmation gate. The Brownian model assumes independent
+    # increments, but BTC mean-reverts at sub-minute scale, so entries whose
+    # last-15s move is FADING (momentum opposite the signal side) are the loss
+    # generator. Official-settlement backtest (90 signal_ready windows, Polymarket
+    # crypto-price): m15-aligned won 88.5% (+0.570/trade) vs m15-fading 72.7%
+    # (-0.359/trade). When True, require the move still pushing in the signal
+    # direction. Replaces the former price-floor gate (a blunt proxy that also
+    # discarded cheap winners: px<0.78 & m15-aligned won 81.5% / +0.609/trade).
+    require_momentum_align: bool = False
 
 
 @dataclass
@@ -340,6 +349,7 @@ def get_skip_reason(
     markov_stats: Optional[dict] = None,
     fee_rate_bps: float = 0.0,
     probability_price: Optional[float] = None,
+    momentum_15s_pct: Optional[float] = None,
 ) -> str:
     """Return why evaluate() returned None, for signal logging.
 
@@ -365,6 +375,14 @@ def get_skip_reason(
         return "delta_too_small"
     if model_side != signal_side:
         return "model_source_side_disagrees"
+    if config.require_momentum_align and momentum_15s_pct is not None:
+        mom_side = (
+            "UP" if momentum_15s_pct > 0
+            else "DOWN" if momentum_15s_pct < 0
+            else None
+        )
+        if mom_side != signal_side:
+            return "momentum_not_aligned"
     market_price = up_market_price if signal_side == "UP" else down_market_price
     if market_price > config.max_price or market_price < config.min_price:
         return "price_out_of_range"
@@ -408,6 +426,7 @@ def evaluate(
     markov_stats: Optional[dict] = None,
     fee_rate_bps: float = 0.0,
     probability_price: Optional[float] = None,
+    momentum_15s_pct: Optional[float] = None,
 ) -> Optional[TradeSignal]:
     """Evaluate whether to enter a trade.
 
@@ -439,6 +458,18 @@ def evaluate(
     model_side = "UP" if model_delta_pct > 0 else "DOWN"
     if model_side != side:
         return None
+
+    # Momentum-confirmation gate (anti-mean-reversion). Skip entries where the
+    # last-15s move is fading (momentum not pushing the signal side) or flat.
+    if config.require_momentum_align and momentum_15s_pct is not None:
+        mom_side = (
+            "UP" if momentum_15s_pct > 0
+            else "DOWN" if momentum_15s_pct < 0
+            else None
+        )
+        if mom_side != side:
+            return None
+
     market_price = up_market_price if side == "UP" else down_market_price
 
     if market_price > config.max_price or market_price < config.min_price:
@@ -478,7 +509,12 @@ def evaluate(
     if bet_size <= 0:
         return None
 
-    bet_size = round(max(config.min_bet, bet_size * risk.size_multiplier), 2)
+    # Full quarter-Kelly. The markov size-haircut (x0.25-0.50) was an EV leak —
+    # it shrank size based on an undersampled transition buffer that is ~0 for
+    # nearly all 5-min signals, not based on losing signals. Outcome is governed
+    # by the momentum-confirmation gate + source consensus, not markov size.
+    # risk.size_multiplier is still recorded on the signal for diagnostics.
+    bet_size = round(max(config.min_bet, bet_size), 2)
 
     confidence = min(gap / 0.10, 1.0)
 

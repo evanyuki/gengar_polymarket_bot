@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-PolyBot v14 — Huge-edge FAK Taker + Hold-to-resolution
+PolyBot v14 — Momentum-confirmed FAK Taker + Hold-to-resolution
 
 Strategy:
   - Brownian motion model with vol=0.12 (recalibrated from 0.08)
-  - Entry gate: model confidence >= 80%, market price <= true_prob * 0.85
-  - Position sizing: quarter-Kelly, $5–$25 per trade
+  - Entry gates: model prob >= MIN_PROB, fee-adjusted net edge >= edge_required,
+    momentum_15s aligned with the signal side (anti-mean-reversion)
+  - Position sizing: quarter-Kelly, MIN_BET–MAX_BET per trade
   - Exit: hold all positions to resolution — no stops, no take-profit
 
 Safety systems:
@@ -183,6 +184,7 @@ class PolyBot:
             markov_insufficient_size_multiplier=float(os.getenv("MARKOV_INSUFFICIENT_SIZE_MULTIPLIER", "0.25")),
             high_price_edge_buffer_threshold=float(os.getenv("HIGH_PRICE_EDGE_BUFFER_THRESHOLD", "0.80")),
             high_price_min_edge=float(os.getenv("HIGH_PRICE_MIN_EDGE", "0.08")),
+            require_momentum_align=os.getenv("ENTRY_REQUIRE_MOMENTUM_ALIGN", "true").lower() == "true",
         )
         initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
         self._daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "30.0"))
@@ -209,6 +211,15 @@ class PolyBot:
         # GET /api/v3/klines index1=open index4=close, weight 2, 5m candles share
         # the bot's wall-clock UTC 5-min grid (openTime%300==0). Fails soft.
         self._seed_vol_enabled: bool = os.getenv("SEED_VOL_FROM_KLINES", "true").lower() == "true"
+        # Entry-price ceiling. Above this, the (1 - price) win payoff is too thin
+        # to justify the forced 5-share CLOB notional: breakeven WR ~= price, so
+        # buying at 0.90 needs ~90% real WR before fees. Skip those.
+        self._entry_max_price: float = float(os.getenv("ENTRY_MAX_PRICE", "0.87"))
+        # Skip when the CLOB minimum-order floor would force a stake more than
+        # this multiple of the Kelly stake. quarter-Kelly sizes losses small vs
+        # wins; the 5-share floor can inflate a high-price bet ~3x over Kelly,
+        # turning one loss into 6-8 wiped wins. Skip when floor > Kelly x ratio.
+        self._min_size_kelly_ratio: float = float(os.getenv("ENTRY_MIN_SIZE_KELLY_RATIO", "1.5"))
         self._current_fee_rate_bps: float = 0.0
         self._cached_up_fee_bps: float = 0.0
         self._cached_down_fee_bps: float = 0.0
@@ -217,7 +228,6 @@ class PolyBot:
         self._open_price_initial_delay: float = float(os.getenv("OPEN_PRICE_INITIAL_DELAY_SECONDS", "6"))
         self._open_price_wait_seconds: float = float(os.getenv("OPEN_PRICE_WAIT_SECONDS", "12"))
         self._open_price_retry_interval: float = float(os.getenv("OPEN_PRICE_RETRY_INTERVAL", "2"))
-        self._huge_edge_min: float = float(os.getenv("ENTRY_HUGE_EDGE_MIN", "0.18"))
         self._fak_slippage_ticks: int = int(os.getenv("ENTRY_FAK_SLIPPAGE_TICKS", "1"))
         self._entry_max_spread: float = float(os.getenv("ENTRY_MAX_SPREAD", "0.08"))
         self._entry_min_exit_price: float = float(os.getenv("ENTRY_MIN_EXIT_PRICE", "0.50"))
@@ -305,9 +315,12 @@ class PolyBot:
         self._recent_window_deltas: list = []  # rolling abs(close_delta_pct) per window
         self._last_sell_price_seen: float = 0.0  # last observed sell price during hold period
 
-        # Pending phantom verification (claim sell reported success but balance didn't move yet)
-        # Resolved at next window boundary once Polygon settlement has had time to land.
-        self._pending_phantom: dict = {}
+        # Deferred trade resolutions (sub-$5 hold-to-resolution, or claim-sell
+        # reported success but balance had not moved yet). Keyed by window_ts so
+        # consecutive deferred windows never overwrite each other. Each is
+        # resolved at a later boundary using the official Polymarket crypto-price
+        # close vs open (settlement truth), NOT a racy wallet-balance delta.
+        self._pending_phantoms: dict = {}
 
         # Pending buy (unverified — Polygon settlement too slow)
         self._pending_buy_side: str = ""
@@ -356,7 +369,7 @@ class PolyBot:
         mp = self.strategy_config.min_prob
         me = self.strategy_config.min_edge
         print("=" * 55)
-        print(f"  PolyBot v14 — Hold-to-resolution + huge-edge FAK taker")
+        print(f"  PolyBot v14 — Hold-to-resolution + momentum-confirmed FAK taker")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
         print(f"  Kelly: {kf*100:.0f}% fraction | "
               f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
@@ -369,6 +382,10 @@ class PolyBot:
             f"size×{self.strategy_config.markov_insufficient_size_multiplier:.2f}"
         )
         print(
+            f"  Momentum gate: {'ON (m15 must align with side)' if self.strategy_config.require_momentum_align else 'OFF'} "
+            f"| markov size-haircut: BYPASSED (full quarter-Kelly)"
+        )
+        print(
             f"  Source gate: {'ON' if self._source_consensus_config.enabled else 'OFF'} | "
             f"RTDS Binance required={self._source_consensus_config.require_rtds_binance} | "
             f"RTDS/CL abnormal gap>{self._source_consensus_config.max_rtds_source_gap_bps:.1f}bps | "
@@ -379,7 +396,7 @@ class PolyBot:
             f"| max age {self._orderbook_max_age:.1f}s"
         )
         print(
-            f"  Entry execution: FAK taker only | huge fee-edge ≥{self._huge_edge_min:.0%} "
+            f"  Entry execution: FAK taker only "
             f"| cap +{self._fak_slippage_ticks} tick if edge survives"
         )
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
@@ -571,6 +588,10 @@ class PolyBot:
         markov_persistence = self._markov_filter.persistence(candidate_side)
         markov_stats = self._markov_filter.transition_stats(candidate_side)
         fee_rate_bps = self._cached_up_fee_bps if candidate_side == "UP" else self._cached_down_fee_bps
+        # Momentum is computed before evaluate() so the momentum-confirmation gate
+        # can use it. Also reused below for gate-tick logging.
+        momentum_15s = self._markov_filter.price_change_pct(15, now=now)
+        momentum_30s = self._markov_filter.price_change_pct(30, now=now)
         signal_result = evaluate(
             btc_price=signal_btc_price,
             opening_price=self._opening_price,
@@ -583,6 +604,7 @@ class PolyBot:
             markov_persistence=markov_persistence,
             markov_stats=markov_stats,
             fee_rate_bps=fee_rate_bps,
+            momentum_15s_pct=momentum_15s,
         )
         candidate_market_price = up_price if candidate_side == "UP" else down_price
         opposite_market_price = down_price if candidate_side == "UP" else up_price
@@ -615,6 +637,7 @@ class PolyBot:
             markov_persistence=markov_persistence,
             markov_stats=markov_stats,
             fee_rate_bps=fee_rate_bps,
+            momentum_15s_pct=momentum_15s,
         )
         if candidate_market_price >= 0.90:
             book_state = "target_extreme_high_no_margin"
@@ -624,8 +647,6 @@ class PolyBot:
             book_state = "complement_extreme"
         else:
             book_state = "normal"
-        momentum_15s = self._markov_filter.price_change_pct(15, now=now)
-        momentum_30s = self._markov_filter.price_change_pct(30, now=now)
         entry_spread = abs((candidate_market_price + opposite_market_price) - 1.0)
         book_imbalance = candidate_market_price - opposite_market_price
         buckets = calibration_buckets(
@@ -679,6 +700,7 @@ class PolyBot:
             "markov_persistence": markov_persistence,
             "fee_rate_bps": fee_rate_bps,
             "source_decision": source_decision,
+            "momentum_15s": momentum_15s,
         }
 
         if signal_result:
@@ -835,75 +857,10 @@ class PolyBot:
 
     def _on_new_window(self, window_ts: int, closing_btc_price: float = 0.0):
         if self._current_window > 0:
-            # Resolve any pending phantom sell from the previous window.
+            # Resolve any deferred trades from earlier windows using official
+            # settlement (crypto-price close vs open), not a wallet-balance delta.
             # Must run before trade state is reset below.
-            # Balance is fetched once here and reused by the sync below.
-            if self._pending_phantom:
-                pp = self._pending_phantom
-                if not self.dry_run and self.executor._initialized:
-                    real_bal = self.executor.get_collateral_balance()
-                    if real_bal > 0:
-                        balance_increase = max(0.0, real_bal - pp["pre_sell_balance"])
-                        if balance_increase > pp["expected_revenue"] * 0.50:
-                            # Settlement landed — it was a real win
-                            profit = balance_increase - pp["cost"]
-                            self.stats.record_win(profit)
-                            self.stats.bankroll = real_bal
-                            self._last_real_balance = real_bal
-                            print(f"  ✅ Phantom resolved: WIN +${profit:.2f} [phantom_resolved] | "
-                                  f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
-                            self.telegram.win_alert(profit, self.stats.total_pnl)
-                            official = self._fetch_official_window_price(pp["window_ts"], retries=2, delay=0.5)
-                            official_open = float(official.open_price or 0.0) if official else 0.0
-                            official_close = float(official.close_price or 0.0) if official else 0.0
-                            final_price = official_close if official_close > 0 else 0.0
-                            final_open = official_open if official_open > 0 else pp["opening_price"]
-                            self.tracker.log_trade_resolve(
-                                btc_final_price=final_price,
-                                opening_price=final_open,
-                                won=True,
-                                profit=profit,
-                                exit_revenue=pp["exit_revenue"],
-                                resolution_method="phantom_resolved",
-                                claim_result="phantom_resolved",
-                                final_price_source="polymarket_crypto_price" if official_close > 0 else "unknown",
-                                official_open_price=official_open,
-                                official_close_price=official_close,
-                                official_completed=bool(official.completed) if official else False,
-                            )
-                        else:
-                            # Balance still hasn't moved — genuine loss
-                            net_loss = pp["cost"] - pp["exit_revenue"]
-                            self.stats.record_loss(net_loss)
-                            self.stats.bankroll = real_bal
-                            self._last_real_balance = real_bal
-                            print(f"  ❌ Phantom confirmed: LOSS -${net_loss:.2f} [phantom_confirmed] | "
-                                  f"P&L: ${self.stats.total_pnl:+.2f} | Bank: ${self.stats.bankroll:.2f}")
-                            self.telegram.loss_alert(net_loss, self.stats.total_pnl)
-                            official = self._fetch_official_window_price(pp["window_ts"], retries=2, delay=0.5)
-                            official_open = float(official.open_price or 0.0) if official else 0.0
-                            official_close = float(official.close_price or 0.0) if official else 0.0
-                            final_price = official_close if official_close > 0 else 0.0
-                            final_open = official_open if official_open > 0 else pp["opening_price"]
-                            self.tracker.log_trade_resolve(
-                                btc_final_price=final_price,
-                                opening_price=final_open,
-                                won=False,
-                                profit=-net_loss,
-                                exit_revenue=pp["exit_revenue"],
-                                resolution_method="phantom_confirmed",
-                                claim_result="phantom_confirmed",
-                                final_price_source="polymarket_crypto_price" if official_close > 0 else "unknown",
-                                official_open_price=official_open,
-                                official_close_price=official_close,
-                                official_completed=bool(official.completed) if official else False,
-                            )
-                        self._pending_phantom = {}
-                else:
-                    # Dry run or executor not ready — treat as loss
-                    net_loss = pp["cost"] - pp["exit_revenue"]
-                    self.stats.record_loss(net_loss)
-                    self._pending_phantom = {}
+            self._resolve_pending_phantoms()
 
             # Record closing delta for rolling vol calculation
             if self._opening_price > 0 and closing_btc_price > 0:
@@ -951,6 +908,7 @@ class PolyBot:
                     realized_vol=self._compute_realized_vol(),
                     markov_persistence=ctx.get("markov_persistence", 1.0),
                     fee_rate_bps=ctx.get("fee_rate_bps", 0.0),
+                    momentum_15s_pct=ctx.get("momentum_15s"),
                 )
                 sig = ctx.get("signal")
                 self.tracker.log_signal(
@@ -1101,6 +1059,69 @@ class PolyBot:
         if not official or not official.open_price or not official.close_price or not official.completed:
             return ""
         return "UP" if official.close_price >= official.open_price else "DOWN"
+
+    def _resolve_pending_phantoms(self) -> None:
+        """Resolve deferred trades against official settlement, keyed per window.
+
+        Settlement truth = Polymarket crypto-price (Chainlink) close vs open for
+        the trade's OWN window (symbol=BTC, fiveminute). A wallet-balance delta
+        is NOT used to decide win/loss: redemption can lag past the boundary and
+        a new window's buy spends balance in between, so the old heuristic
+        mislabeled real wins as losses. Win/loss now comes from the close.
+
+        A window whose official price is not completed yet stays pending and is
+        retried at the next boundary — never dropped, never guessed.
+        """
+        if not self._pending_phantoms:
+            return
+        for window_ts in sorted(self._pending_phantoms.keys()):
+            pp = self._pending_phantoms[window_ts]
+            official = self._fetch_official_window_price(window_ts, retries=2, delay=0.5)
+            winning_side = self._official_winning_side(official)
+            if not winning_side:
+                # Settlement not available yet — keep pending, retry next boundary.
+                print(f"  ⏳ Deferred {pp['side']} @{window_ts}: official price not "
+                      f"settled yet — retry next boundary")
+                continue
+
+            official_open = float(official.open_price or 0.0)
+            official_close = float(official.close_price or 0.0)
+            won = (winning_side == pp["side"])
+            shares = pp.get("shares", 0.0)
+            cost = pp.get("cost", 0.0)
+            exit_revenue = pp.get("exit_revenue", 0.0)
+            if won:
+                # Held to resolution: winning shares redeem at $1 each.
+                profit = (shares * 1.0 + exit_revenue) - cost
+                self.stats.record_win(profit)
+                print(f"  ✅ Auto-resolved WIN +${profit:.2f} [{pp['side']}] | "
+                      f"official {official_open:.2f}->{official_close:.2f} ({winning_side}) | "
+                      f"P&L: ${self.stats.total_pnl:+.2f}")
+                self.telegram.win_alert(profit, self.stats.total_pnl)
+            else:
+                net_loss = cost - exit_revenue
+                profit = -net_loss
+                self.stats.record_loss(net_loss)
+                print(f"  ❌ Auto-resolved LOSS -${net_loss:.2f} [{pp['side']}] | "
+                      f"official {official_open:.2f}->{official_close:.2f} ({winning_side}) | "
+                      f"P&L: ${self.stats.total_pnl:+.2f}")
+                self.telegram.loss_alert(net_loss, self.stats.total_pnl)
+
+            self.tracker.resolve_pending_trade(
+                window_ts=window_ts,
+                btc_final_price=official_close,
+                opening_price=official_open if official_open > 0 else pp.get("opening_price", 0.0),
+                won=won,
+                profit=profit,
+                exit_revenue=exit_revenue,
+                resolution_method="auto_resolution",
+                claim_result="redeemed" if won else "expired_worthless",
+                final_price_source="polymarket_crypto_price",
+                official_open_price=official_open,
+                official_close_price=official_close,
+                official_completed=True,
+            )
+            del self._pending_phantoms[window_ts]
 
     # ── Market prices (cached, complement engine) ───────────────────
 
@@ -1377,39 +1398,11 @@ class PolyBot:
                 f"${old_amount:.2f} → ${trade_amount:.2f}"
             )
 
-        if self.dry_run:
-            required_fee_edge = max(sig.edge_required, self._huge_edge_min)
-            if sig.fee_adjusted_edge < required_fee_edge:
-                print(
-                    f"  ⚠️  Dry-run signal not huge enough for FAK policy — skipping "
-                    f"(fee-edge {sig.fee_adjusted_edge:.3f} < {required_fee_edge:.3f})"
-                )
-                self.tracker.log_signal(
-                    window_ts=self._current_window,
-                    btc_price=self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0,
-                    opening_price=self._opening_price,
-                    up_price=self._cached_up,
-                    down_price=self._cached_down,
-                    seconds_remaining=seconds_remaining,
-                    side=sig.side,
-                    true_prob=sig.true_prob,
-                    market_price=sig.market_price,
-                    edge=sig.edge,
-                    kelly_size=sig.kelly_size,
-                    markov_persistence=sig.markov_persistence,
-                    fee_rate_bps=sig.fee_rate_bps,
-                    fee_adjusted_edge=sig.fee_adjusted_edge,
-                    action="skipped_not_huge_edge",
-                    skip_reason="fee_adjusted_edge_below_huge_taker_threshold",
-                    actual_price=sig.market_price,
-                    actual_edge=sig.edge,
-                )
-                return
-
-        # Huge-edge-only execution: this strategy captures oracle/repricing lag.
-        # If the fee-adjusted edge is not large enough to justify immediate
-        # taker execution, skip. Post-only/GTD maker entry was removed because it
-        # conflicts with the latency edge and creates adverse-selection fills.
+        # FAK taker execution. evaluate() already cleared the edge gate
+        # (net_edge >= edge_required). Below, the live ask is re-checked against
+        # edge_required to catch price slippage between signal and execution.
+        # Post-only/GTD maker entry was removed because it conflicts with the
+        # latency edge and creates adverse-selection fills.
         hint_price = sig.market_price if self.dry_run else 0.0
         depth_snapshot = None
         if not self.dry_run and self.executor._initialized:
@@ -1443,7 +1436,7 @@ class PolyBot:
                 return
 
             actual_edge = sig.true_prob - actual_price
-            required_fee_edge = max(sig.edge_required, self._huge_edge_min)
+            required_fee_edge = sig.edge_required
             price_cap = choose_fak_price_cap(
                 true_prob=sig.true_prob,
                 executable_price=actual_price,
@@ -1459,7 +1452,7 @@ class PolyBot:
                 f"threshold: {required_fee_edge:.3f})"
             )
             if actual_fee_edge < required_fee_edge:
-                print("  ⚠️  Edge is not huge enough for taker execution — skipping")
+                print("  ⚠️  Edge gone at live ask (slippage) — skipping")
                 btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
                 self.tracker.log_signal(
                     window_ts=self._current_window,
@@ -1476,8 +1469,37 @@ class PolyBot:
                     markov_persistence=sig.markov_persistence,
                     fee_rate_bps=sig.fee_rate_bps,
                     fee_adjusted_edge=actual_fee_edge,
-                    action="skipped_not_huge_edge",
-                    skip_reason="fee_adjusted_edge_below_huge_taker_threshold",
+                    action="skipped_edge_gone_at_ask",
+                    skip_reason="edge_below_required_at_live_ask",
+                    actual_price=actual_price,
+                    actual_edge=actual_edge,
+                )
+                return
+
+            # P1b: entry-price ceiling. Above this the (1 - price) win payoff is
+            # too thin to carry the forced 5-share notional — breakeven WR ~=
+            # price, so buying at 0.89 needs ~89% real WR before fees.
+            if actual_price > self._entry_max_price:
+                print(f"  ⛔ Entry price ${actual_price:.3f} > max ${self._entry_max_price:.2f} "
+                      f"— payoff too thin for forced min size, skipping")
+                btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
+                self.tracker.log_signal(
+                    window_ts=self._current_window,
+                    btc_price=btc_approx,
+                    opening_price=self._opening_price,
+                    up_price=self._cached_up,
+                    down_price=self._cached_down,
+                    seconds_remaining=seconds_remaining,
+                    side=sig.side,
+                    true_prob=sig.true_prob,
+                    market_price=actual_price,
+                    edge=actual_edge,
+                    kelly_size=sig.kelly_size,
+                    markov_persistence=sig.markov_persistence,
+                    fee_rate_bps=sig.fee_rate_bps,
+                    fee_adjusted_edge=actual_fee_edge,
+                    action="skipped_entry_price_above_max",
+                    skip_reason="entry_price_above_max",
                     actual_price=actual_price,
                     actual_edge=actual_edge,
                 )
@@ -1486,6 +1508,36 @@ class PolyBot:
             # Ensure budget buys at least the market's minimum share size.
             min_live_amount = round(float(self._market_min_order_size) * price_cap, 2)
             if trade_amount < min_live_amount:
+                # P1a: the CLOB minimum-order floor must not force a stake far
+                # above the Kelly stake. quarter-Kelly sizes losses small vs
+                # wins; if the floor exceeds Kelly x ratio, one loss wipes many
+                # wins — skip rather than over-bet.
+                kelly_amount = trade_amount
+                if min_live_amount > kelly_amount * self._min_size_kelly_ratio:
+                    print(f"  ⛔ Min-size breaks Kelly: floor ${min_live_amount:.2f} > "
+                          f"{self._min_size_kelly_ratio:.1f}x Kelly ${kelly_amount:.2f} — skipping")
+                    btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
+                    self.tracker.log_signal(
+                        window_ts=self._current_window,
+                        btc_price=btc_approx,
+                        opening_price=self._opening_price,
+                        up_price=self._cached_up,
+                        down_price=self._cached_down,
+                        seconds_remaining=seconds_remaining,
+                        side=sig.side,
+                        true_prob=sig.true_prob,
+                        market_price=actual_price,
+                        edge=actual_edge,
+                        kelly_size=kelly_amount,
+                        markov_persistence=sig.markov_persistence,
+                        fee_rate_bps=sig.fee_rate_bps,
+                        fee_adjusted_edge=actual_fee_edge,
+                        action="skipped_min_size_exceeds_kelly",
+                        skip_reason="min_size_exceeds_kelly_budget",
+                        actual_price=actual_price,
+                        actual_edge=actual_edge,
+                    )
+                    return
                 if min_live_amount <= self.strategy_config.max_bet:
                     print(
                         f"  ℹ️  Raising FAK amount to CLOB minimum size: "
@@ -1973,9 +2025,11 @@ class PolyBot:
                 print(f"  💰 {remaining_shares:.0f} shares below $5 min — deferring to auto-resolution")
 
         # ── Deferred fallback ────────────────────────────────────────
-        # The old balance check fired before auto-resolution settled on-chain.
-        # Any unresolved case is now deferred to the next window boundary
-        # (~5 min), where Polygon settlement is guaranteed to have landed.
+        # Sub-$5 hold-to-resolution, or a claim that the balance hasn't confirmed
+        # yet. Resolved at a later boundary against official crypto-price close
+        # vs open for THIS window (see _resolve_pending_phantoms). Stash the
+        # tracker's entry snapshot per window_ts so the next window's entry can
+        # never overwrite it before this trade's own row is written.
         if won is None:
             if not live_token:
                 print(
@@ -1984,20 +2038,18 @@ class PolyBot:
                 )
                 return
             else:
-                if pre_sell_balance <= 0:
-                    pre_sell_balance = self.executor.get_collateral_balance()
-                print(f"  ⏳ Resolution deferred to next window balance sync")
-                self._pending_phantom = {
-                    "pre_sell_balance": pre_sell_balance,
-                    "expected_revenue": remaining_shares * 0.99,
+                window_ts = self._current_window
+                print(f"  ⏳ Resolution deferred to official settlement (window {window_ts})")
+                self._pending_phantoms[window_ts] = {
                     "cost": original_cost,
                     "exit_revenue": self._exit_revenue,
                     "shares": remaining_shares,
                     "side": self._trade_side,
                     "token_id": self._trade_token_id,
-                    "window_ts": self._current_window,
+                    "window_ts": window_ts,
                     "opening_price": self._opening_price,
                 }
+                self.tracker.stash_pending_trade(window_ts)
                 return
 
         if won is None:

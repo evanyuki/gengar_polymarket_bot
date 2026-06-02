@@ -1,6 +1,20 @@
 import math
 
-from strategy import StrategyConfig, evaluate, get_skip_reason
+from strategy import StrategyConfig, evaluate, get_skip_reason, kelly_bet_size
+
+
+def _full_kelly(signal, cfg, bankroll):
+    """Un-haircut quarter-Kelly for a produced signal (Stage 1 applies this)."""
+    full = kelly_bet_size(
+        true_prob=signal.true_prob,
+        market_price=signal.market_price,
+        bankroll=bankroll,
+        fraction=cfg.kelly_fraction,
+        min_bet=cfg.min_bet,
+        max_bet=cfg.max_bet,
+        fee_rate_bps=signal.fee_rate_bps,
+    )
+    return round(max(cfg.min_bet, full), 2)
 
 
 def _risk_config():
@@ -27,7 +41,7 @@ def _risk_config():
     )
 
 
-def test_markov_insufficient_sample_no_longer_hard_blocks_thick_edge_but_downsizes():
+def test_markov_insufficient_sample_records_multiplier_but_sizes_full_kelly_stage1():
     cfg = _risk_config()
 
     signal = evaluate(
@@ -47,8 +61,11 @@ def test_markov_insufficient_sample_no_longer_hard_blocks_thick_edge_but_downsiz
     assert signal is not None
     assert signal.markov_regime == "markov_insufficient_sample"
     assert math.isclose(signal.edge_required, 0.10)
+    # Multiplier is still COMPUTED and recorded for diagnostics ...
     assert math.isclose(signal.markov_size_multiplier, 0.25)
-    assert math.isclose(signal.kelly_size, 2.5)
+    # ... but Stage 1 no longer APPLIES it: size is full quarter-Kelly, not x0.25.
+    assert math.isclose(signal.kelly_size, _full_kelly(signal, cfg, 100.0))
+    assert signal.kelly_size > 2.5
 
 
 def test_markov_medium_high_price_requires_extra_edge_to_avoid_thin_0_80_plus_entries():
@@ -84,7 +101,7 @@ def test_markov_medium_high_price_requires_extra_edge_to_avoid_thin_0_80_plus_en
     assert reason == "markov_edge_buffer_below_required"
 
 
-def test_markov_medium_allows_normal_price_thick_edge_with_half_size():
+def test_markov_medium_records_half_multiplier_but_sizes_full_kelly_stage1():
     cfg = _risk_config()
 
     signal = evaluate(
@@ -105,5 +122,7 @@ def test_markov_medium_allows_normal_price_thick_edge_with_half_size():
     assert signal.side == "DOWN"
     assert signal.markov_regime == "markov_medium"
     assert math.isclose(signal.edge_required, 0.07)
+    # Multiplier still recorded (0.5) ...
     assert math.isclose(signal.markov_size_multiplier, 0.5)
-    assert 1.0 <= signal.kelly_size <= 5.0
+    # ... but Stage 1 sizes at full quarter-Kelly, not half.
+    assert math.isclose(signal.kelly_size, _full_kelly(signal, cfg, 100.0))

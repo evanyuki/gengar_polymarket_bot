@@ -38,6 +38,11 @@ class MarketMetadata:
     minimum_order_size: float = POLY_MIN_NOTIONAL
     minimum_tick_size: float = 0.01
     fee_rate_bps: float = 0.0
+    # CLOB fee = (amount/price) * rate * (p*(1-p))**exponent. Verified live
+    # fd={'r':0.07,'e':1}. The sizing model (effective_market_price) assumes
+    # exponent==1; surface the real exponent so a future e!=1 is caught, not
+    # silently mismodeled.
+    fee_exponent: float = 1.0
     maker_base_fee: float = 0.0
     taker_base_fee: float = 0.0
 
@@ -208,10 +213,17 @@ class Executor:
             mts = float(info.get("mts") or 0.01)
             fd = info.get("fd") or {}
             fee_rate = float(fd.get("r") or 0.0)
+            fee_exponent = float(fd.get("e") if fd.get("e") is not None else 1.0)
+            if fee_exponent != 1.0:
+                # effective_market_price() in strategy assumes exponent==1; a
+                # different exponent would over/understate fees in sizing/edge.
+                print(f"[executor] ⚠️  CLOB fee exponent={fee_exponent} (expected 1) "
+                      f"— sizing model assumes 1; fee estimate may be off")
             metadata = MarketMetadata(
                 minimum_order_size=mos,
                 minimum_tick_size=mts,
                 fee_rate_bps=round(fee_rate * 10_000.0, 6),
+                fee_exponent=fee_exponent,
                 maker_base_fee=float(info.get("mbf") or 0.0),
                 taker_base_fee=float(info.get("tbf") or 0.0),
             )

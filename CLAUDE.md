@@ -8,7 +8,7 @@ An algorithmic trading bot ("PolyBot") for Polymarket's 5-minute BTC Up/Down bin
 
 JLow (jlowplayground on Polymarket). Solo developer. Started from zero software development knowledge in January 2026, built this from scratch using Claude + Cursor. Treats this as a serious trading operation.
 
-## Current version: v14 — Huge-edge FAK taker + Hold-to-resolution
+## Current version: v14 — Momentum-confirmed FAK taker + Hold-to-resolution
 
 ### Files
 
@@ -31,8 +31,9 @@ proxy.py            → Tor proxy for CLOB API geo-restrictions
 
 ### Wallet
 
-- Address: `0xB6bA4816128256af4fa9ac2172991f35c111FC60`
-- Polymarket Safe: `0xbcd8Da52677827188A4c205dCC0D46eda3038A50`
+- Polymarket Safe (live, source of truth = `.env` `SAFE_ADDRESS`): `0xd374a6597e9bf6e279a2676bc043e0e80761e135`
+  - Confirmed via on-chain data-api: this proxy holds the current 5-min BTC trades.
+- Old/prior Safe (deprecated, last on-chain activity 2026-04-21): `0xbcd8Da52677827188A4c205dCC0D46eda3038A50`
 - Signature type: 2 (Safe/proxy)
 
 ---
@@ -43,7 +44,7 @@ proxy.py            → Tor proxy for CLOB API geo-restrictions
 
 Every 5 minutes, Polymarket opens a market: "Will BTC be higher or lower?" Shares pay $1 (correct) or $0 (wrong). BTC moves on Binance instantly, but Polymarket's order book reprices with a lag. The bot buys the correct side during that lag.
 
-### Entry pipeline (three filters)
+### Entry pipeline (four filters)
 
 1. **Brownian motion model** (`estimate_true_probability` in strategy.py)
    - Input: `btc_delta_pct` (BTC move from window open) + `seconds_remaining`
@@ -52,15 +53,17 @@ Every 5 minutes, Polymarket opens a market: "Will BTC be higher or lower?" Share
 
 2. **Minimum probability gate**: live `MIN_PROB=0.86` (code default 0.80) — model must clear that confidence
 
-3. **Fee-adjusted edge gate**: `fee_adjusted_edge(true_prob, market_price, fee) ≥ ENTRY_HUGE_EDGE_MIN`
-   - Live `ENTRY_HUGE_EDGE_MIN=0.08` (code default 0.18); `MIN_EDGE=0.06` is the net-edge floor.
-   - The old `safety_factor` / `market_price ≤ true_prob × 0.85` mechanism was REMOVED. There is no `safety_factor` in the code. Entry is gated directly on fee-adjusted net edge, not a price-vs-prob ratio.
+3. **Fee-adjusted edge gate**: `fee_adjusted_edge(true_prob, market_price, fee) ≥ edge_required`
+   - `edge_required` comes from the markov risk modifier (floor `MIN_EDGE=0.06`). The standalone `ENTRY_HUGE_EDGE_MIN` "huge-edge" gate was REMOVED (2026-06-02): official-settlement backtest proved edge is INVERSELY correlated with WR (edge<0.15 → 91% WR, edge≥0.15 → 61%). A minimum-edge gate selected fat-edge/low-price coin-flip losers. Live execution re-checks the actual ask against `edge_required` only (catches slippage between signal and fill).
+   - The old `safety_factor` / `market_price ≤ true_prob × 0.85` mechanism was also REMOVED. No `safety_factor` in the code.
+
+4. **Momentum-confirmation gate**: live `ENTRY_REQUIRE_MOMENTUM_ALIGN=true` — `momentum_15s_pct` must be the same sign as the signal side (move still pushing, not fading/flat). Anti-mean-reversion. Official-settlement backtest (90 windows): m15-aligned won 88.5% (+0.570/trade) vs m15-fading 72.7% (-0.359/trade). Replaced the removed `ENTRY_PRICE_FLOOR=0.78` gate, which discarded cheap m15-aligned winners (px<0.78 & aligned won 81.5% / +0.609/trade).
 
 ### Position sizing and execution
 
 Quarter-Kelly criterion. `kelly_f = (b*p - q) / b` where `b = (1-price)/price`. Then `bet = bankroll × kelly_f × 0.25`. Bounded by configured `MIN_BET`/`MAX_BET`. CLOB `minimum_order_size` is shares (BTC 5m commonly 5 shares), not a fixed $5 notional; for FAK BUY market orders the bot ensures the dollar amount can buy at least `mos` shares at the worst-price cap.
 
-Execution policy is intentionally narrow: huge-edge FAK taker only. Live `ENTRY_HUGE_EDGE_MIN=0.08` (code default 0.18); signals with lower fee-adjusted edge are skipped. GTD/post-only maker entry was removed because it conflicts with the oracle-lag thesis: if the edge is real and large, immediate execution is worth more than maker fee savings; if the edge is not large, do not trade.
+Execution policy is intentionally narrow: FAK taker only. A signal that clears the four entry filters fires immediately at a worst-price cap (`ENTRY_FAK_SLIPPAGE_TICKS` above the live ask); the live ask is re-validated against `edge_required` first. GTD/post-only maker entry was removed because it conflicts with the oracle-lag thesis: if the edge is real, immediate execution is worth more than maker fee savings.
 
 ### Exit: hold to resolution
 
@@ -116,11 +119,11 @@ Polymarket has TWO order books per token:
 - **Raw token book**: illiquid, $0.06/$0.94 spread, almost no volume.
 - **Complement engine book**: tight 1¢ spreads, all real volume. This is where market makers and the UI trade.
 
-Current v14 entry uses `create_market_order(MarketOrderArgsV2)` + `post_order(..., OrderType.FAK, post_only=False)` for huge-edge taker buys only. Official docs: BUY market orders specify dollar amount; FAK executes immediately against resting liquidity and cancels the remainder. Always pass a worst-price cap and verify by balance/order status.
+Current v14 entry uses `create_market_order(MarketOrderArgsV2)` + `post_order(..., OrderType.FAK, post_only=False)` for taker buys only. Official docs: BUY market orders specify dollar amount; FAK executes immediately against resting liquidity and cancels the remainder. Always pass a worst-price cap and verify by balance/order status.
 
 ### Float precision warning
 
-Older versions avoided BUY market orders because some py-clob-client paths divided `amount/price` and produced share precision artifacts such as `21.000000000004`, rejected as `"invalid amounts, max accuracy of 4 decimals"`. v14 deliberately accepts the market-order path only for huge-edge FAK execution; if this error reappears in live logs, do not silently fall back to GTD/post-only. Either fix the SDK/order builder path or skip the trade.
+Older versions avoided BUY market orders because some py-clob-client paths divided `amount/price` and produced share precision artifacts such as `21.000000000004`, rejected as `"invalid amounts, max accuracy of 4 decimals"`. v14 deliberately accepts the market-order path only for FAK execution; if this error reappears in live logs, do not silently fall back to GTD/post-only. Either fix the SDK/order builder path or skip the trade.
 
 ### Gamma API parsing
 
@@ -193,18 +196,28 @@ DRY_RUN=false
 # Strategy (live values — .env is source of truth, not code defaults)
 MIN_EDGE=0.06
 MIN_PROB=0.86
-ENTRY_HUGE_EDGE_MIN=0.08
 ENTRY_WINDOW_START=210
 ENTRY_WINDOW_END=10
 KELLY_FRACTION=0.25
 MIN_BET=1.0
 MAX_BET=5.0
 BANKROLL=20.0
+MARKOV_INSUFFICIENT_EDGE=0.10
+
+# Entry gates (momentum-confirmation + price/size risk)
+# ENTRY_REQUIRE_MOMENTUM_ALIGN: momentum_15s must match the signal side (anti-mean-reversion).
+#   Replaced the removed ENTRY_PRICE_FLOOR. ENTRY_HUGE_EDGE_MIN also removed (edge inversely predicts WR).
+ENTRY_REQUIRE_MOMENTUM_ALIGN=true
+ENTRY_MAX_PRICE=0.89          # skip above this; (1-price) payoff too thin for forced min size
+ENTRY_MIN_SIZE_KELLY_RATIO=3.0  # skip if CLOB min-share floor > Kelly stake × this
+
+# Realized-vol clamp (floor raised 0.06->0.12 so dead-quiet noise can't read as high confidence)
+VOL_FLOOR=0.12
 
 # Safety
 DAILY_LOSS_LIMIT=10
 
-# Cold-start gating (new — block trading until buffers hold real measurements)
+# Cold-start gating (block trading until buffers hold real measurements)
 ENTRY_REQUIRE_WARM=true
 SEED_VOL_FROM_KLINES=true
 WARM_MIN_SAMPLES=12
@@ -221,7 +234,7 @@ SOURCE_RTDS_SOURCE_GAP_BPS=25.0
 SOURCE_DIRECT_VS_RTDS_BINANCE_GAP_BPS=6.0
 
 # Entry execution
-ENTRY_FAK_SLIPPAGE_TICKS=1
+ENTRY_FAK_SLIPPAGE_TICKS=5
 ENTRY_MAX_SPREAD=0.08
 ENTRY_MIN_EXIT_PRICE=0.50
 CLOB_ORDERBOOK_CACHE_ENABLED=true
@@ -237,6 +250,7 @@ LOG_DIR=logs
 ```
 
 > Exit policy is hardcoded hold-to-resolution. There is NO `STOP_LOSS_ENABLED` env var (it was documented but never read by code).
+> `ENTRY_HUGE_EDGE_MIN` and `ENTRY_PRICE_FLOOR` were removed from code+config on 2026-06-02 — do not re-add as live config.
 
 ---
 
@@ -276,7 +290,7 @@ No automated tests yet. Validation is done via:
 
 ## Open questions / future work
 
-- **Model improvement**: Current model uses one signal (BTC delta from open). Adding momentum (direction of last 30-60s) could filter out bounce-backs that cause losses.
+- **Model improvement**: ~~Adding momentum could filter out bounce-backs~~ — DONE (2026-06-02): `ENTRY_REQUIRE_MOMENTUM_ALIGN` requires `momentum_15s_pct` to align with the signal side. Next: forward-validate live (90-window/2.3-day backtest is small), then consider momentum strength tiers (m15 strong >0.02% won 90% / +0.612/trade) and `m15&m30 aligned & |d|≥0.10` (93.3% / +0.903/trade).
 - **VPS deployment**: Running locally means process crash = lost position. A VPS with systemd/pm2 would add resilience.
 - **Automated testing**: Backtesting framework against historical 5-min windows would allow rapid strategy iteration without risking capital.
 - **Multi-market**: The strategy could theoretically work on ETH, SOL, or other assets' Up/Down markets if they have similar oracle lag.

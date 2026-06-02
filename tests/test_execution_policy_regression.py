@@ -1,7 +1,6 @@
 
 import bot
 from executor import Executor, FILLED, OrderResult
-from strategy import TradeSignal
 
 
 def test_stop_loss_code_is_removed_for_hold_to_resolution(monkeypatch, tmp_path):
@@ -89,83 +88,17 @@ def test_live_buy_uses_fak_taker_market_order_not_gtd_post_only(monkeypatch):
     assert fake_client.order_args.size == 9.0
 
 
-def test_execute_trade_skips_non_huge_edge_before_buy(monkeypatch, tmp_path):
+def test_huge_edge_min_gate_removed(monkeypatch, tmp_path):
+    # The standalone ENTRY_HUGE_EDGE_MIN "huge-edge" gate was removed: official
+    # settlement showed fee-adjusted edge is INVERSELY correlated with win rate
+    # (edge<0.15 -> 91% WR, edge>=0.15 -> 61%), so a minimum-edge gate selected
+    # fat-edge/low-price coin-flip losers. Entry is gated on edge_required only;
+    # the live ask is re-checked against edge_required to catch slippage. The
+    # env var, the _huge_edge_min attribute, and the skip path are all gone.
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.setenv("LOG_DIR", str(tmp_path))
-    monkeypatch.setenv("ENTRY_HUGE_EDGE_MIN", "0.15")
-    monkeypatch.setenv("CLOB_ORDERBOOK_CACHE_ENABLED", "false")
+    monkeypatch.setenv("ENTRY_HUGE_EDGE_MIN", "0.15")  # must be ignored now
+
     polybot = bot.PolyBot()
-    polybot._current_window = 1710000000
-    polybot._opening_price = 75000.0
-    polybot._cached_up = 0.70
-    polybot._cached_down = 0.30
 
-    class FakeMarket:
-        token_id_up = "UPTOKEN"
-        token_id_down = "DOWNTOKEN"
-
-    class FakeClient:
-        def get_ok(self):
-            return True
-
-    class FakeExecutor:
-        _initialized = True
-        client = FakeClient()
-
-        def get_market_price(self, token_id, side, amount):
-            return 0.70 if side == "BUY" else 0.68
-
-        def buy(self, *args, **kwargs):
-            raise AssertionError("non-huge edge should not submit any buy")
-
-    class FakeSourceConsensus:
-        def assess_snapshot(self, side):
-            from source_consensus import SourceConsensusDecision
-            return SourceConsensusDecision(
-                action="normal",
-                reason="sources_agree",
-                size_multiplier=1.0,
-                signal_price=75100.0,
-                signal_side="UP",
-                chainlink_price=75100.0,
-                chainlink_age_seconds=0.1,
-            )
-
-    class FakePriceFeed:
-        def get_price(self):
-            return 75100.0, True
-
-    class FakeTracker:
-        def __init__(self):
-            self.signals = []
-
-        def log_signal(self, **kwargs):
-            self.signals.append(kwargs)
-
-    monkeypatch.setattr(bot, "get_current_market", lambda period, include_open_price=False: FakeMarket())
-    polybot.executor = FakeExecutor()
-    polybot.source_consensus = FakeSourceConsensus()
-    polybot.price_feed = FakePriceFeed()
-    polybot.tracker = FakeTracker()
-
-    sig = TradeSignal(
-        side="UP",
-        confidence=0.9,
-        btc_delta_pct=0.13,
-        market_price=0.70,
-        edge=0.10,
-        true_prob=0.80,
-        seconds_remaining=180,
-        kelly_size=5.0,
-        gap=0.10,
-        fee_adjusted_edge=0.10,
-        fee_rate_bps=0.0,
-        markov_persistence=0.9,
-        edge_required=0.05,
-    )
-
-    polybot._execute_trade(sig, seconds_remaining=180)
-
-    assert polybot._traded is False
-    assert polybot.tracker.signals[-1]["action"] == "skipped_not_huge_edge"
-    assert polybot.tracker.signals[-1]["skip_reason"] == "fee_adjusted_edge_below_huge_taker_threshold"
+    assert not hasattr(polybot, "_huge_edge_min")

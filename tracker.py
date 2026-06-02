@@ -165,6 +165,10 @@ class Tracker:
         self._current_trade: dict = {}
         self._current_trade_path: str = self._trade_path
         self._trade_counter: int = 0
+        # Per-window holding slots for deferred (sub-$5 / hold-to-resolution)
+        # trades. Keyed by window_ts so a later window's entry can never clobber
+        # a deferred trade's entry snapshot before its resolution writes a row.
+        self._pending_trades: dict = {}
 
         # Session stats
         self._session_start = time.time()
@@ -450,9 +454,77 @@ class Tracker:
     ):
         if not self._current_trade:
             return
+        self._finalize_trade_row(
+            self._current_trade, self._current_trade_path,
+            btc_final_price, opening_price, won, profit, exit_revenue,
+            resolution_method, claim_result, final_price_source,
+            official_open_price, official_close_price, official_completed,
+        )
+        self._current_trade = {}
+        self._current_trade_path = self._trade_path
 
-        entry_cost = self._current_trade.get("entry_cost", 0)
-        entry_shares = self._current_trade.get("entry_shares", 0)
+    def stash_pending_trade(self, window_ts: int) -> None:
+        """Move the in-flight trade into a per-window holding slot.
+
+        Hold-to-resolution + sub-$5 deferral resolves a trade one or two window
+        boundaries AFTER entry. Before this, the single-slot `_current_trade`
+        was overwritten by the NEXT window's entry before the deferred
+        resolution wrote its row, so the deferred row was written with the wrong
+        (later) window's entry data. Stashing per window_ts keeps each deferred
+        trade's entry snapshot intact until its own resolution.
+        """
+        if not self._current_trade:
+            return
+        self._pending_trades[int(window_ts)] = (
+            self._current_trade_path, self._current_trade,
+        )
+        self._current_trade = {}
+        self._current_trade_path = self._trade_path
+
+    def has_pending_trade(self, window_ts: int) -> bool:
+        return int(window_ts) in self._pending_trades
+
+    def resolve_pending_trade(
+        self,
+        window_ts: int,
+        btc_final_price: float,
+        opening_price: float,
+        won: bool,
+        profit: float,
+        exit_revenue: float = 0.0,
+        resolution_method: str = "auto_resolution",
+        claim_result: str = "redeemed",
+        final_price_source: str = "polymarket_crypto_price",
+        official_open_price: float = 0.0,
+        official_close_price: float = 0.0,
+        official_completed: bool = False,
+    ) -> bool:
+        """Resolve a previously stashed deferred trade, keyed to its own window.
+
+        Writes the row from the stashed entry snapshot, so it can never be
+        clobbered by a later window's entry. Returns True if a row was written.
+        """
+        entry = self._pending_trades.pop(int(window_ts), None)
+        if not entry:
+            return False
+        path, trade = entry
+        self._finalize_trade_row(
+            trade, path,
+            btc_final_price, opening_price, won, profit, exit_revenue,
+            resolution_method, claim_result, final_price_source,
+            official_open_price, official_close_price, official_completed,
+        )
+        return True
+
+    def _finalize_trade_row(
+        self, trade: dict, path: str,
+        btc_final_price: float, opening_price: float, won: bool, profit: float,
+        exit_revenue: float, resolution_method: str, claim_result: str,
+        final_price_source: str, official_open_price: float,
+        official_close_price: float, official_completed: bool,
+    ) -> None:
+        entry_cost = trade.get("entry_cost", 0)
+        entry_shares = trade.get("entry_shares", 0)
 
         btc_delta = ((btc_final_price - opening_price) / opening_price * 100) if opening_price > 0 else 0
         official_delta = (
@@ -466,41 +538,37 @@ class Tracker:
         resolution_payout = entry_shares * 1.0 if won else 0.0
         profit_if_held = resolution_payout - entry_cost
 
-        self._current_trade["btc_final_price"] = round(btc_final_price, 2)
-        self._current_trade["btc_final_delta_pct"] = round(btc_delta, 4)
-        self._current_trade["final_price_source"] = final_price_source
-        self._current_trade["official_open_price"] = round(official_open_price, 2) if official_open_price > 0 else 0.0
-        self._current_trade["official_close_price"] = round(official_close_price, 2) if official_close_price > 0 else 0.0
-        self._current_trade["official_delta_pct"] = round(official_delta, 4)
-        self._current_trade["official_winning_side"] = official_winning_side
-        self._current_trade["won_resolution"] = won
-        self._current_trade["resolution_payout"] = round(resolution_payout, 2)
-        self._current_trade["resolution_method"] = resolution_method
-        self._current_trade["claim_result"] = claim_result
-        self._current_trade["profit"] = round(profit, 2)
-        self._current_trade["return_pct"] = round(
-            (profit / entry_cost * 100) if entry_cost > 0 else 0, 2
-        )
-        self._current_trade["profit_if_held"] = round(profit_if_held, 2)
+        trade["btc_final_price"] = round(btc_final_price, 2)
+        trade["btc_final_delta_pct"] = round(btc_delta, 4)
+        trade["final_price_source"] = final_price_source
+        trade["official_open_price"] = round(official_open_price, 2) if official_open_price > 0 else 0.0
+        trade["official_close_price"] = round(official_close_price, 2) if official_close_price > 0 else 0.0
+        trade["official_delta_pct"] = round(official_delta, 4)
+        trade["official_winning_side"] = official_winning_side
+        trade["won_resolution"] = won
+        trade["resolution_payout"] = round(resolution_payout, 2)
+        trade["resolution_method"] = resolution_method
+        trade["claim_result"] = claim_result
+        trade["profit"] = round(profit, 2)
+        trade["return_pct"] = round((profit / entry_cost * 100) if entry_cost > 0 else 0, 2)
+        trade["profit_if_held"] = round(profit_if_held, 2)
 
         # Set defaults for missing exit fields (held to resolution)
-        if "exit_type" not in self._current_trade:
-            self._current_trade["exit_type"] = "resolution"
-            self._current_trade["exit_price"] = 0.0
-            self._current_trade["exit_shares_sold"] = 0.0
-            self._current_trade["exit_revenue"] = round(exit_revenue, 2)
-            self._current_trade["residual_shares"] = round(entry_shares, 1)
-            self._current_trade["residual_value"] = 0.0
-            self._current_trade["exit_latency_ms"] = 0
+        if "exit_type" not in trade:
+            trade["exit_type"] = "resolution"
+            trade["exit_price"] = 0.0
+            trade["exit_shares_sold"] = 0.0
+            trade["exit_revenue"] = round(exit_revenue, 2)
+            trade["residual_shares"] = round(entry_shares, 1)
+            trade["residual_value"] = 0.0
+            trade["exit_latency_ms"] = 0
 
         # Fix min_sell_price sentinel
-        if self._current_trade.get("min_sell_price_seen", 999) >= 999:
-            self._current_trade["min_sell_price_seen"] = 0.0
+        if trade.get("min_sell_price_seen", 999) >= 999:
+            trade["min_sell_price_seen"] = 0.0
 
         # Write the complete trade record
-        self._append_row(self._current_trade_path, self._current_trade, TRADE_FIELDS)
-        self._current_trade = {}
-        self._current_trade_path = self._trade_path
+        self._append_row(path, trade, TRADE_FIELDS)
 
     # ── Execution logging ───────────────────────────────────────────
 

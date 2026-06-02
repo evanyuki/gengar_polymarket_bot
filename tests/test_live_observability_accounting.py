@@ -304,7 +304,7 @@ def test_final_prebuy_recheck_uses_same_realized_vol_as_signal_gate(monkeypatch,
         def get_market_price(self, token_id, side, amount):
             return 0.76 if side == "BUY" else 0.74
 
-        def buy(self, token_id, amount_usd, price=0.0, order_type=""):
+        def buy(self, token_id, amount_usd, price=0.0, order_type="", balance_hint=0.0):
             self.buy_calls.append(
                 {"token_id": token_id, "amount_usd": amount_usd, "price": price, "order_type": order_type}
             )
