@@ -6,7 +6,7 @@ An algorithmic trading bot that exploits the oracle lag between Binance real-tim
 
 Every 5 minutes, Polymarket opens a binary market: "Will BTC be higher or lower at the end of this window?" The market resolves automatically — winning shares pay $1.00, losing shares pay $0.00.
 
-This bot watches BTC in real-time via Binance WebSocket while Polymarket's prices lag behind. When BTC has moved significantly but the market hasn't fully priced it in, the bot buys the correct side at a discount and holds to resolution.
+This bot watches Polymarket's Chainlink-anchored BTC feed plus Binance diagnostics while Polymarket's prices lag behind. When the Chainlink settlement-side price has moved significantly from official openPrice but the market hasn't fully priced it in, the bot buys the correct side at a discount, with a 50% price stop as a risk cap.
 
 ### The edge
 
@@ -25,23 +25,27 @@ bot.py                → Main loop, position lifecycle, circuit breakers
 └── proxy.py          → Tor proxy for CLOB API geo-restrictions
 ```
 
-## Strategy (v13 — Recalibrated)
+## Strategy (v15 — Chainlink anchored + price stop)
 
-### Entry filters (three layers)
+### Entry filters
 
-1. **Brownian motion model** — estimates true probability that BTC will be higher/lower at window close, based on current delta from opening price and time remaining. Volatility parameter calibrated to `0.12` from 15-trade backtest showing the original `0.08` was ~2x overconfident in the 60-85% probability range.
+1. **Brownian motion model** — estimates true probability that BTC will be higher/lower at window close, based on Chainlink/current price delta from official openPrice and time remaining. Volatility floor is `0.12`; the original `0.08` was overconfident in small moves.
 
 2. **Minimum probability** — model must output ≥80% confidence before considering entry. Below this, the signal is noise.
 
-3. **Margin of safety** — inspired by value investing: only buy when `market_price ≤ model_probability × 0.85`. Even if the model is 15% wrong, we break even. This filters out situations where the market has already priced in the move.
+3. **Fee-adjusted edge / payoff guard** — only buy when the actual executable ask still clears the required edge after fees and the price/payoff is not too thin.
+
+4. **Momentum alignment** — require short-term momentum to still point in the signal direction.
+
+5. **Near-zero Chainlink gate** — default `CHAINLINK_MIN_DELTA_PCT=0.07`; below that, the settlement-source move is too close to open and historically weak.
 
 ### Position sizing
 
-Quarter-Kelly criterion. At 80%+ win rate with avg entry $0.68, Kelly sizes $8-20 per trade depending on edge and bankroll. Hard floor at $5 (Polymarket minimum notional), hard cap at $25.
+Raw fractional Kelly computes a dollar sanity budget. Live order sizing then converts that into integer shares and enforces the real Polymarket CLOB floor: `minimum_order_size` is a share count (BTC 5m commonly 5 shares), not a fixed $5 notional. If 5 shares at the executable cap is too large vs raw Kelly (`ENTRY_MIN_SIZE_KELLY_RATIO`) or above `MAX_BET`, the bot skips. No `MIN_BET` dollar floor is used.
 
 ### Exit strategy
 
-No stops. All trades hold to resolution. Data from 15 trades showed that probability-based and price-based stops cost $35+ by panic-selling during normal BTC micro-bounces. The 5-minute window is too short for mean-reversion stops — the edge comes from being right at resolution, not from timing exits.
+Default: `STOP_LOSS_ENABLED=true`, `STOP_LOSS_PRICE_FRACTION=0.50`. If the sell price for the held side falls to ≤50% of entry, the bot attempts to sell. If the position is below Polymarket's sell minimum or the stop sell fails, it falls back to resolution. Backtest honesty: the 50% stop reduced historical PnL on the current completed sample, so this is a drawdown/risk cap, not an EV enhancer.
 
 ## Safety systems
 
@@ -61,14 +65,14 @@ Configurable via `DAILY_LOSS_LIMIT` in `.env` (default: $30). Compares session P
 
 ### Balance-verified everything
 
-- **Buys**: Snapshot USDC before order, verify balance drop after. Ghost fills (order succeeds on-chain despite API exception) are caught via balance change.
+- **Buys**: Snapshot collateral before order, verify balance drop after. Ghost fills (order succeeds on-chain despite API exception) are caught via balance change.
 - **Sells**: Balance-verified with partial fill tracking.
-- **Window sync**: Real USDC balance queried at every window boundary, overwrites internal tracking. Drift > $0.50 is logged.
+- **Window sync**: Real collateral balance queried at every window boundary, overwrites internal tracking. Drift > $0.50 is logged.
 - **Pending buy safety net**: If a buy can't be verified within 14s, details are saved. Next window boundary detects the fill via balance drop and retroactively tracks the position.
 
-### Minimum notional guard
+### Sell minimum guard
 
-Polymarket rejects sells below $5 notional. The bot checks before attempting — if remaining shares × price < $5, it holds to resolution instead of hitting the error. Winning shares auto-resolve at $1.00.
+Polymarket enforces market minimum share sizing. The bot checks before attempting a sell; if remaining shares are below the market's sell minimum, it holds to resolution instead of hitting a reject. Winning shares auto-resolve at $1.00.
 
 ## Quick start
 
@@ -106,12 +110,12 @@ python bot.py
 |----------|---------|-------------|
 | `MIN_EDGE` | `0.05` | Minimum edge (prob - price) to enter |
 | `MIN_PROB` | `0.80` | Minimum model probability |
-| `SAFETY_FACTOR` | `0.85` | Only buy at price ≤ prob × this |
 | `ENTRY_WINDOW_START` | `240` | Start evaluating at T-240s |
 | `ENTRY_WINDOW_END` | `10` | Stop evaluating at T-10s |
-| `KELLY_FRACTION` | `0.25` | Quarter-Kelly (conservative) |
-| `MIN_BET` | `5.0` | Polymarket minimum notional |
+| `KELLY_FRACTION` | `0.25` | Raw fractional Kelly sanity budget |
 | `MAX_BET` | `25.0` | Hard cap per trade |
+| `ENTRY_MIN_SIZE_KELLY_RATIO` | `3.0` | Skip if 5-share floor exceeds this multiple of raw Kelly |
+| `CHAINLINK_MIN_DELTA_PCT` | `0.07` | Only settlement-source near-zero gate; Binance delta is not a live gate |
 | `BANKROLL` | `100.0` | Starting bankroll for Kelly sizing |
 
 ### Safety
@@ -148,7 +152,7 @@ These are architectural decisions made from live trading data, not theory:
 
 - **Two-book architecture**: Polymarket has a raw token book (illiquid, wide spreads) and a complement engine book (tight spreads, real volume). All orders must route through the complement engine — the raw book is effectively unusable.
 - **Ghost orders are real fills**: Network exceptions on buys don't mean the order failed. On-chain fills can occur silently. Always verify via balance change, never trust the API response alone.
-- **Float precision kills orders**: `py-clob-client` internally computes `shares × (1 - price)` using float math. `1.0 - 0.71 = 0.29000000000000004` in IEEE 754. The bot uses `create_order` with explicit integer shares to avoid this.
+- **Float precision kills orders**: `py-clob-client-v2` can still hit float artifacts on some market-order amount calculations. The bot uses `create_order` with explicit integer shares for buys to avoid this.
 - **Stops destroy value on 5-min windows**: Prob-stop fired 5 times in testing. 4 of 5 stopped trades won at resolution. Cost: $35.45. BTC micro-bounces trigger panic sells that the 5-minute trend ultimately reverses.
 - **Model calibration matters more than strategy complexity**: Doubling the vol parameter from 0.08 to 0.12 (based on 15 trades of calibration data) turned a -35% ROC strategy into a +55% ROC strategy. Same code, different constant.
 
@@ -156,7 +160,7 @@ These are architectural decisions made from live trading data, not theory:
 
 - **Ghost fills during outages**: When the CLOB confirmation pipeline is down, orders can still execute on-chain. The `get_ok()` circuit breaker prevents *new* orders, but can't recall orders already submitted.
 - **Tor latency**: Routing through Tor adds 200-500ms per API call. The total buy flow is 8-15 seconds. This is acceptable for 5-minute windows but would be a problem for faster markets.
-- **Stranded shares**: Winning positions below $5 notional can't be sold via the API. They auto-resolve on Polymarket but the USDC may take time to appear.
+- **Stranded shares**: Winning positions below $5 notional can't be sold via the API. They auto-resolve on Polymarket but the collateral may take time to appear.
 
 ## Risk warning
 

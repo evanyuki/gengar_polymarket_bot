@@ -1,9 +1,7 @@
 """Telegram notification module with hourly summary reports."""
 
 import os
-import time
 import urllib.request
-import urllib.parse
 import json
 import threading
 
@@ -39,13 +37,37 @@ class TelegramNotifier:
         except Exception as e:
             print(f"[telegram] Failed to send: {e}")
 
-    def trade_alert(self, side: str, price: float, amount: float, market_slug: str, dry_run: bool, edge: float = 0, kelly_size: float = 0):
+    def trade_alert(
+        self,
+        side: str,
+        price: float,
+        amount: float,
+        market_slug: str,
+        dry_run: bool,
+        edge: float = 0,
+        kelly_size: float = 0,
+        raw_kelly_usd: float = 0.0,
+        planned_order_notional_usd: float = 0.0,
+        actual_cash_spent_usd: float = 0.0,
+        estimated_fee_usd: float = 0.0,
+        shares: float = 0.0,
+        sizing_reason: str = "",
+    ):
         mode = "PAPER" if dry_run else "LIVE"
+        raw_kelly = raw_kelly_usd if raw_kelly_usd > 0 else kelly_size
+        planned = planned_order_notional_usd if planned_order_notional_usd > 0 else amount
+        cash = actual_cash_spent_usd if actual_cash_spent_usd > 0 else amount
+        fee = max(0.0, estimated_fee_usd)
+        share_text = f"{shares:.0f}" if shares and abs(shares - round(shares)) < 1e-9 else f"{shares:.2f}"
         self.send(
             f"{'📝' if dry_run else '🔔'} *{mode} TRADE*\n"
             f"Side: *{side}*\n"
             f"Price: ${price:.4f}\n"
-            f"Amount: ${amount:.2f} (Kelly: ${kelly_size:.2f})\n"
+            f"Cash spent: ${cash:.2f} incl fee\n"
+            f"Raw Kelly: ${raw_kelly:.2f}\n"
+            f"Order: {share_text} shares @ ${price:.4f} = ${planned:.2f}\n"
+            f"Fee est: ${fee:.2f}\n"
+            f"Sizing: {sizing_reason or 'raw_kelly_or_live_lot'}\n"
             f"Edge: {edge*100:.1f}%\n"
             f"Market: `{market_slug}`"
         )
@@ -55,6 +77,29 @@ class TelegramNotifier:
 
     def loss_alert(self, loss: float, total_pnl: float):
         self.send(f"❌ *LOSS* -${abs(loss):.2f}\nTotal P&L: ${total_pnl:.2f}")
+
+    def six_hour_dry_run_summary(self, window: dict, overall: dict):
+        """Send 6-hour dry-run validation summary."""
+        self.send(
+            "🧪 *6H DRY RUN SUMMARY*\n"
+            "\n"
+            "*Last 6h:*\n"
+            f"  Signals: {window.get('signals', 0)}\n"
+            f"  Trades: {window.get('trades', 0)} ({window.get('wins', 0)}W / {window.get('losses', 0)}L)\n"
+            f"  Win rate: {window.get('win_rate', 0):.1f}%\n"
+            f"  Sim P&L: ${window.get('pnl', 0):+.2f}\n"
+            f"  p(j*,j*) WR: {window.get('threshold_win_rate', 0):.1f}% "
+            f"({window.get('threshold_trades', 0)} trades)\n"
+            "\n"
+            "*Overall dry run:*\n"
+            f"  Hours: {overall.get('hours', 0):.1f}\n"
+            f"  Signals: {overall.get('signals', 0)}\n"
+            f"  Trades: {overall.get('trades', 0)} ({overall.get('wins', 0)}W / {overall.get('losses', 0)}L)\n"
+            f"  Win rate: {overall.get('win_rate', 0):.1f}%\n"
+            f"  Total P&L: ${overall.get('pnl', 0):+.2f}\n"
+            f"  p(j*,j*) WR: {overall.get('threshold_win_rate', 0):.1f}% "
+            f"({overall.get('threshold_trades', 0)} trades)"
+        )
 
     def hourly_summary(self, hourly: dict, overall: dict):
         """Send the full hourly report with all metrics."""
@@ -112,6 +157,7 @@ class TelegramNotifier:
             f"Mode: *{'DRY RUN' if config.get('dry_run') else 'LIVE'}*\n"
             f"Kelly fraction: {kelly*100:.0f}%\n"
             f"Min edge: {config.get('min_edge', 0)*100:.1f}%\n"
-            f"Bet range: ${config.get('min_bet', 1):.0f}–${config.get('max_bet', 25):.0f}\n"
+            f"Max bet: ${config.get('max_bet', 25):.0f} | "
+            f"CLOB min lot: {config.get('minimum_order_shares', 5):.0f} shares\n"
             f"Entry: T-{config.get('entry_start', 60)}s to T-{config.get('entry_end', 10)}s"
         )

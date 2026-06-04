@@ -68,7 +68,7 @@ print("Step 3: Inspect py-clob-client for geo/header options")
 print("=" * 60)
 try:
     import inspect
-    from py_clob_client.client import ClobClient
+    from py_clob_client_v2.client import ClobClient
     
     sig = inspect.signature(ClobClient.__init__)
     print(f"ClobClient.__init__ params:")
@@ -87,13 +87,13 @@ print("=" * 60)
 print("Step 4: Check for header/geo methods")
 print("=" * 60)
 try:
-    from py_clob_client.client import ClobClient
+    from py_clob_client_v2.client import ClobClient
     methods = [m for m in dir(ClobClient) if 'geo' in m.lower() or 'header' in m.lower() or 'token' in m.lower()]
     print(f"Geo/header/token related methods: {methods}")
     
     # Also check the http helpers module
     try:
-        from py_clob_client import http_helpers
+        from py_clob_client_v2 import http_helpers
         src = inspect.getsource(http_helpers)
         if 'geo' in src.lower():
             # Find lines with 'geo'
@@ -121,14 +121,14 @@ print("=" * 60)
 print("Step 5: Check what headers the CLOB client sends")
 print("=" * 60)
 try:
-    from py_clob_client import headers as clob_headers
+    from py_clob_client_v2 import headers as clob_headers
     src = inspect.getsource(clob_headers)
-    print("py_clob_client/headers.py:")
+    print("py_clob_client_v2/headers.py:")
     print(src[:1500])
 except Exception as e:
     try:
         # Try alternate location
-        from py_clob_client.headers import create_level_2_headers
+        from py_clob_client_v2.headers import create_level_2_headers
         src = inspect.getsource(create_level_2_headers)
         print("create_level_2_headers:")
         print(src[:1000])

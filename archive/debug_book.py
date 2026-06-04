@@ -4,8 +4,8 @@
 import os
 from dotenv import load_dotenv
 from market import get_current_market
-from py_clob_client.client import ClobClient
-from py_clob_client.constants import POLYGON
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.constants import POLYGON
 
 load_dotenv()
 
@@ -17,7 +17,7 @@ client = ClobClient(
     funder=os.getenv("SAFE_ADDRESS", "") or None,
     signature_type=2 if os.getenv("SAFE_ADDRESS") else 0,
 )
-client.set_api_creds(client.create_or_derive_api_creds())
+client.set_api_creds(client.create_or_derive_api_key())
 
 # Get current market
 market = get_current_market(5)

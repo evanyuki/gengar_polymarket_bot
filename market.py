@@ -7,11 +7,14 @@ where window_ts = now - (now % 300), i.e. the start of the current 5-min window.
 import time
 import json
 import urllib.request
+import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+POLYMARKET_WEB_API = "https://polymarket.com/api"
 PERIOD_SECONDS = {5: 300, 15: 900}
 
 
@@ -30,6 +33,23 @@ class MarketWindow:
     @property
     def seconds_remaining(self) -> float:
         return max(0, self.window_end - time.time())
+
+
+@dataclass
+class CryptoWindowPrice:
+    """Polymarket official crypto-price window data.
+
+    For BTC Up/Down markets these open/close prices are the settlement-relevant
+    Chainlink/Polymarket reference values. Binance is only a latency/reference
+    input and must not be used to explain final win/loss when this data exists.
+    """
+
+    symbol: str
+    window_start: int
+    window_end: int
+    open_price: Optional[float]
+    close_price: Optional[float]
+    completed: bool
 
 
 def current_window_ts(period_minutes: int = 5) -> int:
@@ -63,6 +83,76 @@ def fetch_market_by_slug(slug: str) -> Optional[dict]:
         return None
     except Exception as e:
         print(f"[market] Failed to fetch {slug}: {e}")
+        return None
+
+
+def _iso_utc(ts: int) -> str:
+    return datetime.fromtimestamp(int(ts), timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def fetch_crypto_open_price(symbol: str, event_start_time: int) -> Optional[float]:
+    """Fetch Polymarket's fiveminute crypto market openPrice for a window.
+
+    The fiveminute endpoint requires ISO UTC start/end params, not a raw unix
+    timestamp. A raw timestamp returns a broader cached reference price and can
+    incorrectly reuse the same openPrice across many 5-minute markets.
+    """
+    try:
+        start_ts = int(event_start_time)
+        end_ts = start_ts + PERIOD_SECONDS[5]
+        query = urllib.parse.urlencode(
+            {
+                "symbol": symbol.upper(),
+                "eventStartTime": _iso_utc(start_ts),
+                "variant": "fiveminute",
+                "endDate": _iso_utc(end_ts),
+            }
+        )
+        url = f"{POLYMARKET_WEB_API}/crypto/crypto-price?{query}"
+        req = urllib.request.Request(url, headers={"User-Agent": "PolyBot/1.0"})
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode())
+        open_price = data.get("openPrice")
+        return float(open_price) if open_price is not None else None
+    except Exception as e:
+        print(f"[market] Failed to fetch crypto open price {symbol} {event_start_time}: {e}")
+        return None
+
+
+def fetch_crypto_window_price(symbol: str, event_start_time: int) -> Optional[CryptoWindowPrice]:
+    """Fetch Polymarket's official fiveminute open/close prices for a window.
+
+    This wraps the same `crypto/crypto-price` endpoint used for openPrice, but
+    retains closePrice/completed so trade resolution logs can be reconciled
+    against Polymarket's official settlement source instead of Binance.
+    """
+    try:
+        start_ts = int(event_start_time)
+        end_ts = start_ts + PERIOD_SECONDS[5]
+        query = urllib.parse.urlencode(
+            {
+                "symbol": symbol.upper(),
+                "eventStartTime": _iso_utc(start_ts),
+                "variant": "fiveminute",
+                "endDate": _iso_utc(end_ts),
+            }
+        )
+        url = f"{POLYMARKET_WEB_API}/crypto/crypto-price?{query}"
+        req = urllib.request.Request(url, headers={"User-Agent": "PolyBot/1.0"})
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read().decode())
+        open_price = data.get("openPrice")
+        close_price = data.get("closePrice")
+        return CryptoWindowPrice(
+            symbol=symbol.upper(),
+            window_start=start_ts,
+            window_end=end_ts,
+            open_price=float(open_price) if open_price is not None else None,
+            close_price=float(close_price) if close_price is not None else None,
+            completed=bool(data.get("completed", close_price is not None)),
+        )
+    except Exception as e:
+        print(f"[market] Failed to fetch crypto window price {symbol} {event_start_time}: {e}")
         return None
 
 
@@ -113,7 +203,7 @@ def extract_token_ids(event_data: dict) -> tuple[str, str]:
     return token_up, token_down
 
 
-def get_current_market(period_minutes: int = 5) -> Optional[MarketWindow]:
+def get_current_market(period_minutes: int = 5, include_open_price: bool = True) -> Optional[MarketWindow]:
     """Get the current active 5-min BTC market with all required info."""
     wts = current_window_ts(period_minutes)
     slug = market_slug(period_minutes, wts)
@@ -151,6 +241,8 @@ def get_current_market(period_minutes: int = 5) -> Optional[MarketWindow]:
                     up_price = float(outcome_prices[i])
                 elif outcome.lower() == "down":
                     down_price = float(outcome_prices[i])
+
+    opening_price = fetch_crypto_open_price("btc", wts) if include_open_price else None
     
     return MarketWindow(
         slug=slug,
@@ -159,6 +251,7 @@ def get_current_market(period_minutes: int = 5) -> Optional[MarketWindow]:
         token_id_down=token_down,
         window_start=wts,
         window_end=wts + period,
+        opening_price=opening_price,
         up_price=up_price,
         down_price=down_price,
     )

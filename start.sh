@@ -1,15 +1,25 @@
 #!/bin/bash
 # PolyBot Startup Script
-# Handles: stale Tor, port conflicts, tmux, caffeinate
+# Handles: stale Tor, port conflicts, tmux, and Linux/macOS keep-awake when available.
 # Usage: ./start.sh
 
-set -e
+set -euo pipefail
 
-PROJ_DIR="$HOME/gengar_bot/gengar_polybot"
+PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SESSION_NAME="polybot"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+TOR_DATA_DIR="$HOME/.tor/data"
+
+if command -v caffeinate >/dev/null 2>&1; then
+    RUN_CMD="caffeinate -i $PYTHON_BIN bot.py"
+else
+    RUN_CMD="$PYTHON_BIN bot.py"
+fi
 
 echo "🚀 PolyBot Startup"
 echo "══════════════════════════════════"
+echo "Project: $PROJ_DIR"
+echo "Python:  $PYTHON_BIN"
 
 # 1. Kill stale Tor processes and clear cached data
 echo "🧹 Cleaning up stale Tor processes..."
@@ -20,11 +30,11 @@ if pgrep -x tor > /dev/null 2>&1; then
 else
     echo "   ✓ No stale Tor processes"
 fi
-rm -rf "$HOME/gengar_bot/.tor/data"
-echo "   ✓ Tor data cache cleared"
+rm -rf "$TOR_DATA_DIR"
+echo "   ✓ Tor data cache cleared: $TOR_DATA_DIR"
 
 # 2. Free port 9050 if occupied
-if lsof -i :9050 > /dev/null 2>&1; then
+if command -v lsof >/dev/null 2>&1 && lsof -i :9050 > /dev/null 2>&1; then
     echo "🔌 Port 9050 in use, killing..."
     lsof -ti :9050 | xargs kill -9 2>/dev/null || true
     sleep 2
@@ -42,10 +52,10 @@ else
     echo "   ✓ No existing tmux session"
 fi
 
-# 4. Launch tmux with caffeinate + bot
+# 4. Launch tmux with bot
 echo "🖥  Starting tmux session '$SESSION_NAME'..."
 tmux new-session -d -s "$SESSION_NAME" -c "$PROJ_DIR" \
-    "caffeinate -i python bot.py; echo '⚠️  Bot exited. Press enter to close.'; read"
+    "$RUN_CMD; echo '⚠️  Bot exited. Press enter to close.'; read"
 
 echo ""
 echo "══════════════════════════════════"
