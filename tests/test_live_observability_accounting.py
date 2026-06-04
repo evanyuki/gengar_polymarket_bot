@@ -240,11 +240,16 @@ def test_reverse_orderbook_pre_entry_gate_skips_live_buy(monkeypatch, tmp_path):
         def log_signal(self, **kwargs):
             self.signals.append(kwargs)
 
+    class FakeSourceConsensus:
+        def assess_snapshot(self, side):
+            return SourceConsensusDecision("normal", "ok", 75220.0, side, 75220.0, 0.1)
+
     monkeypatch.setattr(bot, "get_current_market", lambda period: FakeMarket())
     polybot.executor = FakeExecutor()
     polybot._orderbook_cache_enabled = False
     polybot.price_feed = FakePriceFeed()
     polybot.rtds_feed = FakeReferenceFeed()
+    polybot.source_consensus = FakeSourceConsensus()
     polybot.tracker = FakeTracker()
 
     sig = TradeSignal(
@@ -335,7 +340,6 @@ def test_final_prebuy_recheck_uses_same_realized_vol_as_signal_gate(monkeypatch,
             return SourceConsensusDecision(
                 action="normal",
                 reason="source_consensus_ok",
-                size_multiplier=1.0,
                 signal_price=99.9164,
                 signal_side="DOWN",
                 chainlink_price=None,

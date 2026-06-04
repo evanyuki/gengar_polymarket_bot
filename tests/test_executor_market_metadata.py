@@ -1,4 +1,4 @@
-from executor import Executor, POLY_MIN_NOTIONAL
+from executor import Executor, POLY_MIN_ORDER_SHARES
 
 
 class FakeMetadataClient:
@@ -32,4 +32,4 @@ def test_executor_reads_clob_market_info_for_mos_mts_and_fee_rate():
 def test_executor_falls_back_to_static_min_notional_when_metadata_missing():
     executor = Executor(private_key="", safe_address="", dry_run=False)
 
-    assert executor.min_order_size == POLY_MIN_NOTIONAL
+    assert executor.min_order_size == POLY_MIN_ORDER_SHARES

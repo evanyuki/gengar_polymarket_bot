@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-PolyBot v14 — Momentum-confirmed FAK Taker + Hold-to-resolution
+PolyBot v15 — Chainlink-anchored FAK taker + 50% price stop
 
 Strategy:
   - Brownian motion model with vol=0.12 (recalibrated from 0.08)
   - Entry gates: model prob >= MIN_PROB, fee-adjusted net edge >= edge_required,
     momentum_15s aligned with the signal side (anti-mean-reversion)
-  - Position sizing: quarter-Kelly, MIN_BET–MAX_BET per trade
-  - Exit: hold all positions to resolution — no stops, no take-profit
+  - Position sizing: raw fractional Kelly as sanity budget, then CLOB minimum-share lot sizing
+  - Exit: 50% price stop with resolution fallback
 
 Safety systems:
   1. CLOB health check: get_ok() before every trade; 3 consecutive
@@ -29,7 +29,6 @@ import os
 import sys
 import time
 import signal
-import math
 import statistics
 from dotenv import load_dotenv
 
@@ -54,7 +53,7 @@ from strategy import (
 )
 from markov import MarkovPersistenceFilter
 from security import sanitize_exception_text
-from executor import Executor, MAX_BUY_PRICE, POLY_MIN_NOTIONAL, calculate_order_size
+from executor import Executor, MAX_BUY_PRICE, POLY_MIN_ORDER_SHARES, plan_minimum_lot_order
 from telegram_notifier import TelegramNotifier
 from tracker import Tracker
 from clob_orderbook_cache import ClobOrderBookCache
@@ -65,22 +64,20 @@ POSITION_CHECK_INTERVAL = 3
 
 def choose_fak_price_cap(
     *,
-    true_prob: float,
     executable_price: float,
-    fee_rate_bps: float,
-    required_fee_edge: float,
     tick_size: float = 0.01,
-    slippage_ticks: int = 1,
 ) -> float:
-    """Return the highest FAK cap whose fee-adjusted edge still clears policy."""
+    """Return the current executable FAK cap; never pads above the live ask.
+
+    Paying +N ticks was not a free fill improvement: for BTC 5m it directly
+    worsens required win rate/payoff ratio. If the ask walks, skip and log it;
+    do not chase. There is no slippage-chase parameter — the cap is structurally
+    the executable price rounded to tick, bounded by MAX_BUY_PRICE.
+    """
     if executable_price <= 0:
         return 0.0
     tick = tick_size if tick_size > 0 else 0.01
-    base = round(round(executable_price / tick) * tick, 6)
-    cap = min(MAX_BUY_PRICE, 1.0 - tick, round(base + max(0, slippage_ticks) * tick, 6))
-    if fee_adjusted_edge(true_prob, cap, fee_rate_bps) >= required_fee_edge:
-        return cap
-    return base
+    return min(MAX_BUY_PRICE, 1.0 - tick, round(round(executable_price / tick) * tick, 6))
 
 
 def compute_resolution_bankroll(bankroll_before_resolution: float, total_received: float) -> float:
@@ -167,24 +164,18 @@ class PolyBot:
         self.strategy_config = StrategyConfig(
             min_edge=float(os.getenv("MIN_EDGE", "0.05")),
             min_prob=float(os.getenv("MIN_PROB", "0.80")),
-            min_btc_delta=float(os.getenv("MIN_BTC_DELTA", "0.06")),
             entry_window_start=int(os.getenv("ENTRY_WINDOW_START", "240")),
             entry_window_end=int(os.getenv("ENTRY_WINDOW_END", "10")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
-            min_bet=float(os.getenv("MIN_BET", "5.0")),
             max_bet=float(os.getenv("MAX_BET", "25.0")),
             markov_persistence_threshold=float(os.getenv("MARKOV_PERSISTENCE_THRESHOLD", "0.87")),
             markov_medium_threshold=float(os.getenv("MARKOV_MEDIUM_THRESHOLD", "0.75")),
             markov_weak_min_transitions=int(os.getenv("MARKOV_WEAK_MIN_TRANSITIONS", "5")),
-            markov_medium_edge=float(os.getenv("MARKOV_MEDIUM_EDGE", "0.07")),
-            markov_weak_edge=float(os.getenv("MARKOV_WEAK_EDGE", "0.08")),
-            markov_insufficient_edge=float(os.getenv("MARKOV_INSUFFICIENT_EDGE", "0.10")),
-            markov_medium_size_multiplier=float(os.getenv("MARKOV_MEDIUM_SIZE_MULTIPLIER", "0.50")),
-            markov_weak_size_multiplier=float(os.getenv("MARKOV_WEAK_SIZE_MULTIPLIER", "0.35")),
-            markov_insufficient_size_multiplier=float(os.getenv("MARKOV_INSUFFICIENT_SIZE_MULTIPLIER", "0.25")),
             high_price_edge_buffer_threshold=float(os.getenv("HIGH_PRICE_EDGE_BUFFER_THRESHOLD", "0.80")),
             high_price_min_edge=float(os.getenv("HIGH_PRICE_MIN_EDGE", "0.08")),
             require_momentum_align=os.getenv("ENTRY_REQUIRE_MOMENTUM_ALIGN", "true").lower() == "true",
+            min_payoff_ratio=float(os.getenv("ENTRY_MIN_PAYOFF_RATIO", "0.15")),
+            max_required_win_rate=float(os.getenv("ENTRY_MAX_REQUIRED_WR", "0.87")),
         )
         initial_bankroll = float(os.getenv("BANKROLL", "100.0"))
         self._daily_loss_limit = float(os.getenv("DAILY_LOSS_LIMIT", "30.0"))
@@ -223,37 +214,33 @@ class PolyBot:
         self._current_fee_rate_bps: float = 0.0
         self._cached_up_fee_bps: float = 0.0
         self._cached_down_fee_bps: float = 0.0
-        self._market_min_order_size: float = POLY_MIN_NOTIONAL
+        self._market_min_order_size: float = POLY_MIN_ORDER_SHARES
         self._market_tick_size: float = 0.01
         self._open_price_initial_delay: float = float(os.getenv("OPEN_PRICE_INITIAL_DELAY_SECONDS", "6"))
         self._open_price_wait_seconds: float = float(os.getenv("OPEN_PRICE_WAIT_SECONDS", "12"))
         self._open_price_retry_interval: float = float(os.getenv("OPEN_PRICE_RETRY_INTERVAL", "2"))
-        self._fak_slippage_ticks: int = int(os.getenv("ENTRY_FAK_SLIPPAGE_TICKS", "1"))
         self._entry_max_spread: float = float(os.getenv("ENTRY_MAX_SPREAD", "0.08"))
         self._entry_min_exit_price: float = float(os.getenv("ENTRY_MIN_EXIT_PRICE", "0.50"))
+        # Price stop-loss. Data says this is a risk cap, not an EV booster:
+        # Phase-2 observed 50% stops would have reduced DRY P&L, but it prevents
+        # a position from riding a collapsed sell price all the way to zero when
+        # the CLOB can actually sell the held shares. Disable only explicitly.
+        self._stop_loss_enabled: bool = os.getenv("STOP_LOSS_ENABLED", "true").lower() == "true"
+        self._stop_loss_price_fraction: float = float(os.getenv("STOP_LOSS_PRICE_FRACTION", "0.50"))
         self._source_consensus_config = SourceConsensusConfig(
             enabled=os.getenv("SOURCE_CONSENSUS_ENABLED", "true").lower() == "true",
             require_chainlink=os.getenv(
                 "SOURCE_REQUIRE_CHAINLINK",
                 "true" if not self.dry_run else "false",
             ).lower() == "true",
-            require_rtds_binance=os.getenv(
-                "SOURCE_REQUIRE_RTDS_BINANCE",
-                "true" if not self.dry_run else "false",
-            ).lower() == "true",
-            stale_downsize_seconds=float(os.getenv("SOURCE_STALE_DOWNSIZE_SEC", "10.0")),
             stale_skip_seconds=float(os.getenv("SOURCE_STALE_SKIP_SEC", "30.0")),
-            downsize_factor=float(os.getenv("SOURCE_DOWNSIZE_FACTOR", "0.50")),
-            max_rtds_source_gap_bps=float(os.getenv("SOURCE_RTDS_SOURCE_GAP_BPS", "25.0")),
-            max_direct_vs_rtds_binance_gap_bps=float(os.getenv("SOURCE_DIRECT_VS_RTDS_BINANCE_GAP_BPS", "6.0")),
-            min_chainlink_delta_pct=float(os.getenv("CHAINLINK_MIN_DELTA_PCT", "0.02")),
-            binance_chainlink_basis_bps=float(os.getenv("SOURCE_BINANCE_CHAINLINK_BASIS_BPS", "14.5")),
-            lag_adverse_deadband_bps=float(os.getenv("SOURCE_LAG_ADVERSE_DEADBAND_BPS", "5.0")),
+            min_chainlink_delta_pct=float(os.getenv("CHAINLINK_MIN_DELTA_PCT", "0.07")),
         )
         self.source_consensus = SourceConsensusGate(self._source_consensus_config)
         self._orderbook_cache_enabled: bool = os.getenv("CLOB_ORDERBOOK_CACHE_ENABLED", "true").lower() == "true"
         self._orderbook_max_age: float = float(os.getenv("CLOB_ORDERBOOK_MAX_AGE_SEC", "1.0"))
         self.orderbook_cache = ClobOrderBookCache(max_book_age_seconds=self._orderbook_max_age)
+        self._sdk_metadata_warmed: bool = False
         self._current_market = None
 
         self.price_feed = BinancePriceFeed()
@@ -273,12 +260,11 @@ class PolyBot:
 
         self._running = False
         self._current_window: int = 0
-        # _opening_price is the Binance window-open (de-biased signal anchor):
-        # the bot's own Binance price at the window boundary. All Binance-delta
-        # signal/model/log math anchors to this. _chainlink_open_price is the
-        # Chainlink/Polymarket settlement open, used only for Chainlink-side
-        # source-consensus checks and settlement reconciliation. They differ by a
-        # near-constant Binance/Chainlink basis (~14bps) — never mix them.
+        # _opening_price is the local Binance boundary tick retained for
+        # diagnostics and momentum history only. _chainlink_open_price is the
+        # Polymarket/Chainlink official openPrice and is the live entry anchor.
+        # Direction/probability should be official-open anchored whenever a fresh
+        # RTDS/Chainlink tick exists; Binance must not veto the final hot path.
         self._opening_price: float = 0.0
         self._chainlink_open_price: float = 0.0
         self._window_open_price_missing: bool = False
@@ -331,6 +317,11 @@ class PolyBot:
         self._pending_buy_edge: float = 0.0
         self._pending_buy_delta: float = 0.0
         self._balance_before_buy: float = 0.0
+        # Full entry-context snapshot for an unverified buy, so a late-detected
+        # fill still writes a complete trades.csv entry row (not just a
+        # resolution against a stale _current_trade). Accounting fields are
+        # filled from the actual wallet delta at detection time.
+        self._pending_buy_entry: dict = {}
 
         # Unclaimed
         self._unclaimed_winnings: float = 0.0
@@ -369,17 +360,16 @@ class PolyBot:
         mp = self.strategy_config.min_prob
         me = self.strategy_config.min_edge
         print("=" * 55)
-        print(f"  PolyBot v14 — Hold-to-resolution + momentum-confirmed FAK taker")
+        print(f"  PolyBot v15 — Chainlink-anchored FAK taker + 50% price stop")
         print(f"  Mode: {'DRY RUN' if self.dry_run else '🔴 LIVE TRADING'}")
-        print(f"  Kelly: {kf*100:.0f}% fraction | "
-              f"Bets: ${self.strategy_config.min_bet:.0f}–${self.strategy_config.max_bet:.0f}")
-        print(f"  Min prob: {mp:.0%} | ε gap: {me:.0%} | Min BTC delta: {self.strategy_config.min_btc_delta:.2f}%")
+        print(f"  Kelly: {kf*100:.0f}% raw fraction | "
+              f"Max bet: ${self.strategy_config.max_bet:.0f} | "
+              f"CLOB min lot: {self._market_min_order_size:.0f} shares")
+        print(f"  Min prob: {mp:.0%} | ε gap: {me:.0%} | Chainlink near-zero gate: {self._source_consensus_config.min_chainlink_delta_pct:.2f}%")
         print(
-            f"  Markov risk: strong ≥{self.strategy_config.markov_persistence_threshold:.0%}; "
-            f"medium ≥{self.strategy_config.markov_medium_threshold:.0%} needs "
-            f"edge≥{self.strategy_config.markov_medium_edge:.0%} size×{self.strategy_config.markov_medium_size_multiplier:.2f}; "
-            f"insufficient needs edge≥{self.strategy_config.markov_insufficient_edge:.0%} "
-            f"size×{self.strategy_config.markov_insufficient_size_multiplier:.2f}"
+            f"  Markov: LOG ONLY (regime/persistence recorded; no entry gate, no size haircut) | "
+            f"Payoff gate: min ratio≥{self.strategy_config.min_payoff_ratio:.2f}, "
+            f"required WR≤{self.strategy_config.max_required_win_rate:.0%}"
         )
         print(
             f"  Momentum gate: {'ON (m15 must align with side)' if self.strategy_config.require_momentum_align else 'OFF'} "
@@ -387,8 +377,8 @@ class PolyBot:
         )
         print(
             f"  Source gate: {'ON' if self._source_consensus_config.enabled else 'OFF'} | "
-            f"RTDS Binance required={self._source_consensus_config.require_rtds_binance} | "
-            f"RTDS/CL abnormal gap>{self._source_consensus_config.max_rtds_source_gap_bps:.1f}bps | "
+            f"Chainlink required={self._source_consensus_config.require_chainlink} | "
+            f"CL near-zero<{self._source_consensus_config.min_chainlink_delta_pct:.2f}% | "
             f"stale skip>{self._source_consensus_config.stale_skip_seconds:.0f}s"
         )
         print(
@@ -396,13 +386,17 @@ class PolyBot:
             f"| max age {self._orderbook_max_age:.1f}s"
         )
         print(
-            f"  Entry execution: FAK taker only "
-            f"| cap +{self._fak_slippage_ticks} tick if edge survives"
+            f"  Entry execution: FAK taker/no-order dry-run "
+            f"| cap = current executable quote (no +tick chase)"
         )
         print(f"  Entry: T-{self.strategy_config.entry_window_start}s to "
               f"T-{self.strategy_config.entry_window_end}s")
         print(f"  Vol: dynamic (fallback=0.12, floor={self._vol_floor}, cap={self._vol_cap}, windows={self._rolling_vol_windows})")
-        print(f"  Exits: hold to resolution")
+        stop_label = (
+            f"price-stop @{self._stop_loss_price_fraction:.0%} of entry + resolution fallback"
+            if self._stop_loss_enabled else "hold to resolution"
+        )
+        print(f"  Exits: {stop_label}")
         print(f"  Daily loss limit: ${self._daily_loss_limit:.0f}")
         print(f"  Bankroll: ${self.stats.bankroll:.2f}")
         print("=" * 55)
@@ -438,8 +432,8 @@ class PolyBot:
             "dry_run": self.dry_run,
             "kelly_fraction": kf,
             "min_edge": self.strategy_config.min_edge,
-            "min_bet": self.strategy_config.min_bet,
             "max_bet": self.strategy_config.max_bet,
+            "minimum_order_shares": self._market_min_order_size,
             "entry_start": self.strategy_config.entry_window_start,
             "entry_end": self.strategy_config.entry_window_end,
         })
@@ -566,17 +560,24 @@ class PolyBot:
         if self._traded or self._trade_attempted:
             return
 
-        # IDLE: Binance direct WS is the low-latency signal; RTDS Binance and
-        # RTDS Chainlink are risk sources, compared directly.
+        # IDLE: official-open anchored signal. Binance direct WS remains useful
+        # for local momentum/diagnostics, but trade side/probability are based on
+        # RTDS Chainlink vs Polymarket/Chainlink openPrice when available.
         chainlink_price = self.rtds_feed.get_latest()
         get_rtds_binance = getattr(self.rtds_feed, "get_binance_latest", None)
         rtds_binance_price = get_rtds_binance() if callable(get_rtds_binance) else None
-        signal_btc_price = btc_price
+        entry_ref = self._entry_reference_price(binance_price=btc_price, chainlink=chainlink_price)
+        if not self.dry_run and (entry_ref["price"] <= 0 or not entry_ref["side"]):
+            # No live Binance fallback: settlement-source Chainlink/openPrice is
+            # the only side/probability anchor. Missing/stale Chainlink means no trade.
+            return
+        signal_btc_price = entry_ref["price"]
+        signal_opening_price = entry_ref["opening_price"]
 
         up_price, down_price = self._get_market_prices(signal_btc_price, seconds_remaining)
 
         realized_vol = self._compute_realized_vol()
-        candidate_side = "UP" if signal_btc_price >= self._opening_price else "DOWN"
+        candidate_side = entry_ref["side"]
         source_decision = self.source_consensus.update_snapshot(
             binance_price=btc_price,
             opening_price=self._chainlink_open_price,
@@ -594,7 +595,7 @@ class PolyBot:
         momentum_30s = self._markov_filter.price_change_pct(30, now=now)
         signal_result = evaluate(
             btc_price=signal_btc_price,
-            opening_price=self._opening_price,
+            opening_price=signal_opening_price,
             up_market_price=up_price,
             down_market_price=down_price,
             seconds_remaining=seconds_remaining,
@@ -608,27 +609,50 @@ class PolyBot:
         )
         candidate_market_price = up_price if candidate_side == "UP" else down_price
         opposite_market_price = down_price if candidate_side == "UP" else up_price
-        btc_delta_pct = ((signal_btc_price - self._opening_price) / self._opening_price * 100) if self._opening_price > 0 else 0.0
-        # Model runs on the de-biased Binance move (same anchor as the signal),
-        # NOT Chainlink-vs-open: the ~14bps basis would otherwise poison the
-        # probability and force model_side to disagree with the signal.
+        btc_delta_pct = ((signal_btc_price - signal_opening_price) / signal_opening_price * 100) if signal_opening_price > 0 else 0.0
+        # Model runs on the same anchor as the signal. In live trading that is
+        # RTDS Chainlink vs official Polymarket openPrice, not Binance vs local
+        # boundary tick. This removes the observed Binance-basis direction bug.
         model_delta_pct = btc_delta_pct
         true_prob = estimate_true_probability(model_delta_pct, seconds_remaining, vol=realized_vol)
         candidate_true_prob = true_prob
         raw_edge = candidate_true_prob - candidate_market_price
         net_edge = fee_adjusted_edge(candidate_true_prob, candidate_market_price, fee_rate_bps)
+        chainlink_raw_price = float(getattr(chainlink_price, "price", 0.0) or 0.0) if chainlink_price else 0.0
+        rtds_binance_raw_price = float(getattr(rtds_binance_price, "price", 0.0) or 0.0) if rtds_binance_price else 0.0
+        chainlink_delta_pct = (
+            (chainlink_raw_price - self._chainlink_open_price) / self._chainlink_open_price * 100.0
+            if chainlink_raw_price > 0 and self._chainlink_open_price > 0 else 0.0
+        )
+        rtds_binance_delta_pct = (
+            (rtds_binance_raw_price - self._opening_price) / self._opening_price * 100.0
+            if rtds_binance_raw_price > 0 and self._opening_price > 0 else 0.0
+        )
+        signal_delta_pct = btc_delta_pct
+        entry_observability = {
+            "entry_signal_source": entry_ref["source"],
+            "entry_signal_price": signal_btc_price,
+            "entry_signal_open_price": signal_opening_price,
+            "entry_signal_delta_pct": signal_delta_pct,
+            "entry_chainlink_price": chainlink_raw_price,
+            "entry_chainlink_delta_pct": chainlink_delta_pct,
+            "entry_rtds_binance_price": rtds_binance_raw_price,
+            "entry_rtds_binance_delta_pct": rtds_binance_delta_pct,
+        }
+        if signal_result:
+            for key, value in entry_observability.items():
+                setattr(signal_result, key, value)
         diagnostic_kelly = kelly_bet_size(
             true_prob=candidate_true_prob,
             market_price=candidate_market_price,
             bankroll=self.stats.bankroll,
             fraction=self.strategy_config.kelly_fraction,
-            min_bet=self.strategy_config.min_bet,
             max_bet=self.strategy_config.max_bet,
             fee_rate_bps=fee_rate_bps,
         )
         gate_reason = "signal_ready" if signal_result else get_skip_reason(
             btc_price=signal_btc_price,
-            opening_price=self._opening_price,
+            opening_price=signal_opening_price,
             up_market_price=up_price,
             down_market_price=down_price,
             seconds_remaining=seconds_remaining,
@@ -660,7 +684,7 @@ class PolyBot:
             window_ts=self._current_window,
             btc_price=btc_price,
             signal_btc_price=signal_btc_price,
-            opening_price=self._opening_price,
+            opening_price=signal_opening_price,
             up_price=up_price,
             down_price=down_price,
             seconds_remaining=seconds_remaining,
@@ -677,6 +701,17 @@ class PolyBot:
             realized_vol=realized_vol,
             fee_rate_bps=fee_rate_bps,
             source_decision=source_decision,
+            signal_source=entry_ref["source"],
+            signal_price=signal_btc_price,
+            signal_opening_price=signal_opening_price,
+            signal_delta_pct=signal_delta_pct,
+            signal_side=candidate_side,
+            chainlink_price=chainlink_raw_price,
+            chainlink_open_price=self._chainlink_open_price,
+            chainlink_delta_pct=chainlink_delta_pct,
+            rtds_binance_price=rtds_binance_raw_price,
+            rtds_binance_open_price=self._opening_price,
+            rtds_binance_delta_pct=rtds_binance_delta_pct,
             gate_reason=gate_reason,
             signal_ready=bool(signal_result),
             extreme_book=book_state != "normal",
@@ -727,26 +762,23 @@ class PolyBot:
                 self._log_source_skip(signal_result, seconds_remaining, source_decision, "skipped_source_disagreement")
                 self._trade_attempted = True
                 return
-            if source_decision.action == "downsize":
-                old_size = signal_result.kelly_size
-                signal_result.kelly_size = round(max(
-                    self.strategy_config.min_bet,
-                    signal_result.kelly_size * source_decision.size_multiplier,
-                ), 2)
-                print(
-                    f"  ⚠️  Source risk downsize ({source_decision.reason}): "
-                    f"${old_size:.2f} → ${signal_result.kelly_size:.2f}"
-                )
+            # SourceConsensus no longer downsizes based on Binance/RTDS. Binance is
+            # diagnostic only; the settlement-source Chainlink gate either skips
+            # unsafe entries or leaves raw Kelly sizing unchanged.
             self._execute_trade(signal_result, seconds_remaining)
 
         if now - self._last_status_print >= 30:
             self._last_status_print = now
             delta = ((btc_price - self._opening_price) / self._opening_price * 100) if self._opening_price > 0 else 0
             d = "↑" if delta > 0 else "↓" if delta < 0 else "→"
+            chainlink_delta_for_state = (
+                abs((chainlink_raw_price - self._chainlink_open_price) / self._chainlink_open_price * 100.0)
+                if chainlink_raw_price > 0 and self._chainlink_open_price > 0 else None
+            )
             if self._traded:
                 state = "HOLDING"
-            elif self._opening_price > 0 and abs(delta) < self.strategy_config.min_btc_delta:
-                state = f"ΔSMALL ({abs(delta):.3f}%<{self.strategy_config.min_btc_delta:.3f}%)"
+            elif chainlink_delta_for_state is not None and chainlink_delta_for_state < self._source_consensus_config.min_chainlink_delta_pct:
+                state = f"CLΔSMALL ({chainlink_delta_for_state:.3f}%<{self._source_consensus_config.min_chainlink_delta_pct:.3f}%)"
             else:
                 state = "IDLE"
             n = len(self._recent_window_deltas)
@@ -766,13 +798,62 @@ class PolyBot:
                 f"vol={vol_label} | P&L ${self.stats.total_pnl:+.2f} [{state}]"
             )
 
+    def _entry_reference_price(self, *, binance_price: float, chainlink) -> dict:
+        """Return the price/open anchor used for entry side and probability.
+
+        The 5m market settles from Polymarket/Chainlink, so live entry is
+        anchored to official openPrice plus the freshest RTDS Chainlink tick.
+        Binance is retained only for dry-run fallback and diagnostics; live must
+        not silently fall back to Binance for side/probability.
+        """
+        chainlink_price = float(getattr(chainlink, "price", 0.0) or 0.0) if chainlink else 0.0
+        chainlink_age = getattr(chainlink, "age_seconds", None) if chainlink else None
+        stale_limit = float(getattr(self.source_consensus.config, "stale_skip_seconds", 30.0) or 30.0)
+        chainlink_fresh = (
+            chainlink_price > 0
+            and self._chainlink_open_price > 0
+            and (chainlink_age is None or float(chainlink_age) <= stale_limit)
+        )
+        if chainlink_fresh:
+            opening_price = float(self._chainlink_open_price)
+            side = "UP" if chainlink_price >= opening_price else "DOWN"
+            return {
+                "price": chainlink_price,
+                "opening_price": opening_price,
+                "side": side,
+                "source": "polymarket_rtds_chainlink",
+                "age_seconds": chainlink_age,
+            }
+
+        if not self.dry_run:
+            source = "missing_chainlink" if chainlink_price <= 0 or self._chainlink_open_price <= 0 else "stale_chainlink"
+            return {
+                "price": 0.0,
+                "opening_price": float(self._chainlink_open_price or 0.0),
+                "side": "",
+                "source": source,
+                "age_seconds": chainlink_age,
+            }
+
+        opening_price = float(self._opening_price or 0.0)
+        side = "UP" if binance_price >= opening_price else "DOWN"
+        return {
+            "price": float(binance_price or 0.0),
+            "opening_price": opening_price,
+            "side": side,
+            "source": "binance_fallback",
+            "age_seconds": None,
+        }
+
     # ── Active position management ──────────────────────────────────
 
-    # ── Position monitoring (hold to resolution) ────────────────────
+    # ── Position monitoring + price-stop exit ───────────────────────
 
     def _manage_position(self, btc_price: float, seconds_remaining: float, now: float):
-        """Monitor only — all trades hold to resolution. No stops.
-        Tracker logs hold-period stats for future optimization.
+        """Monitor active position and fire the configured price stop.
+
+        Resolution remains the fallback when the position is unsellable or the
+        stop order fails; sell prices are also logged for calibration.
         """
         if self._opening_price <= 0:
             return
@@ -807,13 +888,13 @@ class PolyBot:
                     f"  ⏱  T-{seconds_remaining:5.1f}s | "
                     f"BN {d}{abs(btc_delta_pct):.3f}% | {ref_label} | "
                     f"Prob: {our_prob:.2f} | "
-                    f"P&L ${self.stats.total_pnl:+.2f} [HOLDING→RES]"
+                    f"P&L ${self.stats.total_pnl:+.2f} [STOP/RES]"
                 )
             return
 
         self._last_position_check = now
 
-        # Get current sell price (for tracking only)
+        # Get current sell price for stop-loss and diagnostics.
         if self.dry_run:
             current_sell_price = round(max(our_prob, 0.01), 2)
         else:
@@ -834,10 +915,11 @@ class PolyBot:
         unrealized_pnl = current_value - self._trade_cost
         return_pct = (current_sell_price - self._trade_price) / self._trade_price if self._trade_price > 0 else 0
 
-        # Hold-to-resolution policy: no stop-loss/prob-stop exits here. Sell
-        # price is observed only for diagnostics and post-session calibration.
+        if self._should_price_stop(current_sell_price):
+            self._execute_price_stop(current_sell_price)
+            return
 
-        # Status line (monitoring only — no exits)
+        # Status line
         d = "↑" if btc_delta_pct > 0 else "↓" if btc_delta_pct < 0 else "→"
         ref_label = (
             f"CL {chainlink_delta_pct:+.3f}%/{chainlink_price.age_seconds:.1f}s"
@@ -852,6 +934,102 @@ class PolyBot:
             f"Sell: ${current_sell_price:.3f} | "
             f"PnL: ${unrealized_pnl:+.2f} ({return_pct:+.0%})"
         )
+
+    def _should_price_stop(self, current_sell_price: float) -> bool:
+        if not self._stop_loss_enabled:
+            return False
+        if self._trade_price <= 0 or current_sell_price <= 0:
+            return False
+        return current_sell_price <= self._trade_price * self._stop_loss_price_fraction
+
+    def _execute_price_stop(self, current_sell_price: float) -> None:
+        """Exit a held position when the sell price collapses below stop threshold.
+
+        This is a loss cap, not a claim about positive EV. LIVE sells are still
+        subject to Polymarket minimum share/order constraints; if the held size
+        is unsellable, the bot must hold to resolution rather than submit a
+        guaranteed-rejected order.
+        """
+        if not self._traded or self._trade_shares <= 0:
+            return
+
+        stop_threshold = self._trade_price * self._stop_loss_price_fraction
+        if not self.dry_run and self._trade_shares < self._market_min_order_size:
+            print(
+                f"  ⚠️  Price-stop hit (${current_sell_price:.3f} ≤ ${stop_threshold:.3f}) "
+                f"but {self._trade_shares:.1f} shares < {self._market_min_order_size:.0f} min — hold to resolution"
+            )
+            return
+
+        started = time.time()
+        if self.dry_run:
+            shares_sold = self._trade_shares
+            exit_revenue = shares_sold * current_sell_price
+            success = True
+            error = ""
+        else:
+            result = self.executor.sell(self._trade_token_id, self._trade_shares, current_sell_price)
+            success = result.success
+            error = result.error
+            shares_sold = result.shares if success else 0.0
+            exit_revenue = result.amount_usd if success else 0.0
+
+        latency_ms = (time.time() - started) * 1000.0
+        self.tracker.log_execution(
+            window_ts=self._current_window,
+            action="price_stop_sell",
+            latency_ms=latency_ms,
+            success=success,
+            error=error,
+            details=f"sell_price={current_sell_price:.4f}; threshold={stop_threshold:.4f}",
+        )
+        if not success:
+            print(f"  ❌ Price-stop sell failed: {error} — hold to resolution")
+            return
+
+        residual_shares = max(0.0, self._trade_shares - shares_sold)
+        self._exit_revenue += exit_revenue
+        self.tracker.log_trade_exit(
+            exit_type="price-stop",
+            exit_price=current_sell_price,
+            exit_shares_sold=shares_sold,
+            exit_revenue=exit_revenue,
+            residual_shares=residual_shares,
+            latency_ms=latency_ms,
+        )
+
+        print(
+            f"  🛑 PRICE STOP: sold {shares_sold:.1f}/{self._trade_shares:.1f} "
+            f"@ ${current_sell_price:.3f} (threshold ${stop_threshold:.3f}) "
+            f"→ revenue ${exit_revenue:.2f}"
+        )
+
+        if residual_shares >= 1.0:
+            # Hold the residual to resolution. Do NOT reduce _trade_cost here:
+            # _record_resolution already applies _exit_revenue against the full
+            # original cost (net_loss = cost - _exit_revenue / total = _exit_revenue
+            # + settlement). Decrementing the cost basis too would double-count the
+            # partial proceeds, silently understating losses / overstating wins.
+            # Keeping the full cost basis also makes multiple partial stops sum
+            # correctly via _exit_revenue accumulation.
+            self._trade_shares = residual_shares
+            return
+
+        self._record_resolution(
+            won=False,
+            original_cost=self._trade_cost,
+            remaining_shares=0.0,
+            resolution_method="price_stop_50pct",
+            claim_revenue=0.0,
+            claim_result="price_stop_exit",
+            final_price_source="exit_price_not_settlement",
+        )
+        self._traded = False
+        self._trade_side = ""
+        self._trade_price = 0.0
+        self._trade_cost = 0.0
+        self._trade_shares = 0.0
+        self._trade_token_id = ""
 
     # ── Window management ───────────────────────────────────────────
 
@@ -875,11 +1053,24 @@ class PolyBot:
                     if real_bal > 0 and self._balance_before_buy > 0:
                         spent = self._balance_before_buy - real_bal
                         if spent > 1.0:
-                            # The buy DID go through — retroactively track it
-                            est_shares = spent / self._pending_buy_price if self._pending_buy_price > 0 else 0
+                            # The buy DID go through — retroactively track it.
+                            # Use the INTENDED integer share count (what we
+                            # submitted), NOT spent/price: spent includes the
+                            # CLOB fee, so dividing it back by price inflates the
+                            # count (e.g. $4.05 / $0.79 = 5.1 for a 5-share order).
+                            # Fee is the residual: spent - shares*price.
+                            est_shares = (
+                                float(int(self._pending_buy_shares))
+                                if self._pending_buy_shares >= 1
+                                else float(int(spent / self._pending_buy_price))
+                                if self._pending_buy_price > 0 else 0.0
+                            )
+                            planned_notional = round(est_shares * self._pending_buy_price, 2)
+                            est_fee = max(0.0, round(spent - planned_notional, 2))
                             print(f"\n  👻 LATE FILL: balance dropped ${spent:.2f} since buy attempt")
-                            print(f"     Retroactively tracking: ~{est_shares:.0f} shares "
-                                  f"{self._pending_buy_side} @ ${self._pending_buy_price:.3f}")
+                            print(f"     Retroactively tracking: {est_shares:.0f} shares "
+                                  f"{self._pending_buy_side} @ ${self._pending_buy_price:.3f} "
+                                  f"(notional ${planned_notional:.2f}, fee≈${est_fee:.2f})")
 
                             self._traded = True
                             self._trade_side = self._pending_buy_side
@@ -891,6 +1082,21 @@ class PolyBot:
                             self._last_real_balance = real_bal
                             self.stats.hourly.record_trade(
                                 self._pending_buy_edge, self._pending_buy_delta)
+                            # Stage the full entry row so the upcoming
+                            # _resolve_previous_trade writes a complete trade
+                            # (entry + resolution), not a resolution against a
+                            # stale _current_trade. Shares stay the intended int;
+                            # cash/notional/fee come from the actual wallet delta.
+                            if self._pending_buy_entry:
+                                self.tracker.log_trade_entry(
+                                    **self._pending_buy_entry,
+                                    entry_shares=est_shares,
+                                    entry_cost=spent,
+                                    mode="DRY" if self.dry_run else "LIVE",
+                                    planned_order_notional_usd=planned_notional,
+                                    actual_cash_spent_usd=spent,
+                                    estimated_fee_usd=est_fee,
+                                )
 
             self.stats.hourly.record_window(self._traded)
             if self._traded:
@@ -969,12 +1175,14 @@ class PolyBot:
         self._pending_buy_edge = 0.0
         self._pending_buy_delta = 0.0
         self._balance_before_buy = 0.0
+        self._pending_buy_entry = {}
         self._window_signals_detected = 0
         self._entry_markov_state = ""
         self._entry_markov_persistence = 0.0
         self._entry_markov_threshold = self.strategy_config.markov_persistence_threshold
         self._entry_markov_passed = False
         self._window_open_price_missing = False
+        self._sdk_metadata_warmed = False
 
         market = self._wait_for_official_open_price(window_ts)
         self._current_market = market
@@ -1126,14 +1334,22 @@ class PolyBot:
     # ── Market prices (cached, complement engine) ───────────────────
 
     def _refresh_market_metadata_and_orderbook(self, market) -> None:
-        if not market or self.dry_run or not self.executor._initialized:
+        if not market:
             return
         try:
-            metadata = self.executor.get_market_metadata(market.condition_id)
-            self._market_min_order_size = metadata.minimum_order_size
-            self._market_tick_size = metadata.minimum_tick_size
-            self._cached_up_fee_bps = metadata.fee_rate_bps
-            self._cached_down_fee_bps = metadata.fee_rate_bps
+            if not self.dry_run and self.executor._initialized:
+                metadata = self.executor.get_market_metadata(market.condition_id)
+                self._market_min_order_size = metadata.minimum_order_size
+                self._market_tick_size = metadata.minimum_tick_size
+                self._cached_up_fee_bps = metadata.fee_rate_bps
+                self._cached_down_fee_bps = metadata.fee_rate_bps
+                warm_fn = getattr(self.executor, "warm_order_metadata", None)
+                if callable(warm_fn):
+                    warm_raw = warm_fn([market.token_id_up, market.token_id_down])
+                    warm = warm_raw if isinstance(warm_raw, dict) else {}
+                    self._sdk_metadata_warmed = bool(warm.get("tokens", 0))
+                    if warm.get("errors"):
+                        print(f"  ⚠️  SDK metadata warmup partial: {len(warm.get('errors', []))} errors")
             if self._orderbook_cache_enabled:
                 self.orderbook_cache.subscribe([market.token_id_up, market.token_id_down])
                 self.orderbook_cache.start()
@@ -1243,18 +1459,10 @@ class PolyBot:
         )
 
     def _get_market_prices(self, btc_price: float, seconds_remaining: float) -> tuple:
-        if self.dry_run or not self.executor._initialized:
-            if self._opening_price <= 0:
-                return 0.50, 0.50
-            delta_pct = (btc_price - self._opening_price) / self._opening_price
-            time_factor = 1 - (seconds_remaining / PERIOD_SECONDS[self.period])
-            lag_factor = min(time_factor * 0.7, 0.85)
-            implied = 0.5 + lag_factor * math.tanh(delta_pct * 500) * 0.45
-            up = round(min(max(implied, 0.02), 0.98), 3)
-            self._cached_up_fee_bps = 0.0
-            self._cached_down_fee_bps = 0.0
-            return up, round(1.0 - up, 3)
-
+        # DRY_RUN is quote-only, not synthetic-price paper trading. Use the same
+        # real CLOB quote path as live and simply avoid submitting orders later.
+        # If no fresh quote exists, return cached/zero and let gates skip; never
+        # fabricate tanh prices to evaluate PnL.
         now = time.time()
         market = self._current_market
         try:
@@ -1303,24 +1511,13 @@ class PolyBot:
     def _execute_trade(self, sig, seconds_remaining: float):
         self._trade_attempted = True
 
-        # ── Circuit breaker: CLOB health check ───────────────────
+        # Circuit breaker state only. Do not ping CLOB health on every buy: the
+        # unauthenticated GET adds avoidable hot-path latency, while the FAK POST
+        # itself plus buy-failure counter is the actionable health signal. When
+        # halted, recovery is still probed once per new window in _on_new_window.
         if self._clob_halted:
             print(f"  🔌 CLOB HALTED — skipping trade ({self._consecutive_buy_failures} consecutive failures)")
             return
-
-        if not self.dry_run and self.executor._initialized:
-            try:
-                self.executor.client.get_ok()
-            except Exception as e:
-                self._consecutive_buy_failures += 1
-                print(f"  🔌 CLOB health check failed: {e}")
-                if self._consecutive_buy_failures >= self._HALT_AFTER_FAILURES:
-                    self._clob_halted = True
-                    msg = (f"🔌 CLOB HALTED after {self._consecutive_buy_failures} "
-                           f"consecutive health check failures — stopping trades until recovery")
-                    print(f"\n  {msg}")
-                    self.telegram.status_update({"alert": msg})
-                return
 
         # ── Daily loss limit ─────────────────────────────────────
         if self._daily_loss_halted:
@@ -1337,8 +1534,8 @@ class PolyBot:
             self.telegram.status_update({"alert": msg})
             return
 
-        market = self._current_market if not self.dry_run else None
-        if not market and not self.dry_run:
+        market = self._current_market
+        if not market:
             try:
                 market = get_current_market(self.period, include_open_price=False)
             except TypeError:
@@ -1350,10 +1547,14 @@ class PolyBot:
         if market:
             token_id = market.token_id_up if sig.side == "UP" else market.token_id_down
         else:
-            token_id = f"DRY-{sig.side}-{self._current_window}"
+            print("  ⚠️  No current Polymarket market/token — skipping entry (DRY and LIVE both require real CLOB path)")
+            return
 
         slug = f"btc-updown-{self.period}m-{self._current_window}"
-        trade_amount = round(sig.kelly_size, 2)
+        raw_kelly_usd = round(sig.kelly_size, 2)
+        trade_amount = raw_kelly_usd
+        planned_order_notional_usd = 0.0
+        sizing_reason = "raw_kelly"
 
         print(f"\n  🎯 {sig.side} | Δ={sig.gap:.3f} | fee-edge={sig.fee_adjusted_edge:.3f} | "
               f"req={sig.edge_required:.3f} | prob={sig.true_prob:.2f} | "
@@ -1361,7 +1562,13 @@ class PolyBot:
         print(f"     Kelly: ${trade_amount:.2f} | mkt ${sig.market_price:.3f} | fee {sig.fee_rate_bps:.1f}bps | T-{seconds_remaining:.0f}s")
 
         source_decision = self.source_consensus.assess_snapshot(sig.side)
-        if source_decision.reason == "source_snapshot_missing":
+        if source_decision.reason == "source_snapshot_missing" and not self.dry_run:
+            # LIVE hot path must not synchronously refresh source snapshots or
+            # fallback to Binance. If RTDS/Chainlink snapshot is missing, skip.
+            # Waiting here loses the execution race and can resurrect the old
+            # wrong-source direction bug.
+            pass
+        elif source_decision.reason == "source_snapshot_missing":
             latest_btc, latest_fresh = self.price_feed.get_price()
             latest_chainlink = self.rtds_feed.get_latest()
             get_rtds_binance = getattr(self.rtds_feed, "get_binance_latest", None)
@@ -1386,18 +1593,6 @@ class PolyBot:
             )
             self._log_source_skip(sig, seconds_remaining, source_decision, "skipped_source_disagreement")
             return
-        if source_decision.action == "downsize":
-            old_amount = trade_amount
-            trade_amount = round(max(
-                self.strategy_config.min_bet,
-                trade_amount * source_decision.size_multiplier,
-            ), 2)
-            sig.kelly_size = trade_amount
-            print(
-                f"  ⚠️  Source risk downsize snapshot ({source_decision.reason}): "
-                f"${old_amount:.2f} → ${trade_amount:.2f}"
-            )
-
         # FAK taker execution. evaluate() already cleared the edge gate
         # (net_edge >= edge_required). Below, the live ask is re-checked against
         # edge_required to catch price slippage between signal and execution.
@@ -1405,11 +1600,12 @@ class PolyBot:
         # latency edge and creates adverse-selection fills.
         hint_price = sig.market_price if self.dry_run else 0.0
         depth_snapshot = None
-        if not self.dry_run and self.executor._initialized:
+        entry_snapshot = None
+        if market and (self.dry_run or self.executor._initialized):
             actual_price = 0.0
             if self._orderbook_cache_enabled:
                 actual_price = self.orderbook_cache.get_market_price(token_id, "BUY", trade_amount)
-            if actual_price <= 0:
+            else:
                 actual_price = self.executor.get_market_price(token_id, "BUY", trade_amount)
             if actual_price <= 0:
                 print("  ⚠️  No executable CLOB ask before FAK entry — skipping")
@@ -1438,12 +1634,8 @@ class PolyBot:
             actual_edge = sig.true_prob - actual_price
             required_fee_edge = sig.edge_required
             price_cap = choose_fak_price_cap(
-                true_prob=sig.true_prob,
                 executable_price=actual_price,
-                fee_rate_bps=sig.fee_rate_bps,
-                required_fee_edge=required_fee_edge,
                 tick_size=self._market_tick_size,
-                slippage_ticks=self._fak_slippage_ticks,
             )
             actual_fee_edge = fee_adjusted_edge(sig.true_prob, price_cap, sig.fee_rate_bps)
             print(
@@ -1505,86 +1697,90 @@ class PolyBot:
                 )
                 return
 
-            # Ensure budget buys at least the market's minimum share size.
-            min_live_amount = round(float(self._market_min_order_size) * price_cap, 2)
-            if trade_amount < min_live_amount:
-                # P1a: the CLOB minimum-order floor must not force a stake far
-                # above the Kelly stake. quarter-Kelly sizes losses small vs
-                # wins; if the floor exceeds Kelly x ratio, one loss wipes many
-                # wins — skip rather than over-bet.
-                kelly_amount = trade_amount
-                if min_live_amount > kelly_amount * self._min_size_kelly_ratio:
-                    print(f"  ⛔ Min-size breaks Kelly: floor ${min_live_amount:.2f} > "
-                          f"{self._min_size_kelly_ratio:.1f}x Kelly ${kelly_amount:.2f} — skipping")
-                    btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
-                    self.tracker.log_signal(
-                        window_ts=self._current_window,
-                        btc_price=btc_approx,
-                        opening_price=self._opening_price,
-                        up_price=self._cached_up,
-                        down_price=self._cached_down,
-                        seconds_remaining=seconds_remaining,
-                        side=sig.side,
-                        true_prob=sig.true_prob,
-                        market_price=actual_price,
-                        edge=actual_edge,
-                        kelly_size=kelly_amount,
-                        markov_persistence=sig.markov_persistence,
-                        fee_rate_bps=sig.fee_rate_bps,
-                        fee_adjusted_edge=actual_fee_edge,
-                        action="skipped_min_size_exceeds_kelly",
-                        skip_reason="min_size_exceeds_kelly_budget",
-                        actual_price=actual_price,
-                        actual_edge=actual_edge,
-                    )
-                    return
-                if min_live_amount <= self.strategy_config.max_bet:
-                    print(
-                        f"  ℹ️  Raising FAK amount to CLOB minimum size: "
-                        f"${trade_amount:.2f} → ${min_live_amount:.2f} "
-                        f"({self._market_min_order_size:.0f} shares @ cap ${price_cap:.3f})"
-                    )
-                    trade_amount = min_live_amount
-                    sig.kelly_size = trade_amount
-                else:
-                    print(
-                        f"  ⚠️  CLOB minimum size too large — skipping "
-                        f"(${min_live_amount:.2f} required > max ${self.strategy_config.max_bet:.2f})"
-                    )
-                    btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
-                    self.tracker.log_signal(
-                        window_ts=self._current_window,
-                        btc_price=btc_approx,
-                        opening_price=self._opening_price,
-                        up_price=self._cached_up,
-                        down_price=self._cached_down,
-                        seconds_remaining=seconds_remaining,
-                        side=sig.side,
-                        true_prob=sig.true_prob,
-                        market_price=actual_price,
-                        edge=actual_edge,
-                        kelly_size=trade_amount,
-                        markov_persistence=sig.markov_persistence,
-                        fee_rate_bps=sig.fee_rate_bps,
-                        fee_adjusted_edge=actual_fee_edge,
-                        action="skipped_size_too_small",
-                        skip_reason="clob_min_size_exceeds_max_bet",
-                        actual_price=actual_price,
-                        actual_edge=actual_edge,
-                    )
-                    return
-
-            planned_shares, _planned_spend = calculate_order_size(price_cap, trade_amount)
-            if self._orderbook_cache_enabled and planned_shares > 0:
-                depth_snapshot = self.orderbook_cache.get_buy_depth_snapshot(
-                    token_id,
-                    required_shares=planned_shares,
-                    cap_price=price_cap,
-                )
+            # Live sizing is minimum-share-lot aware. Polymarket's
+            # minimum_order_size is shares (BTC 5m commonly 5), not a fixed $5
+            # notional. Raw Kelly is only the sanity budget; do not floor it with
+            # a fake MIN_BET dollar value.
+            lot_plan = plan_minimum_lot_order(
+                price=price_cap,
+                raw_kelly_usd=trade_amount,
+                minimum_order_shares=self._market_min_order_size,
+                max_bet_usd=self.strategy_config.max_bet,
+                max_floor_to_kelly_ratio=self._min_size_kelly_ratio,
+            )
+            if not lot_plan.executable:
                 print(
-                    f"  📚 Ask depth≤cap: {depth_snapshot.cumulative_shares:.0f}/"
+                    f"  ⛔ Minimum-share lot not executable ({lot_plan.reason}): "
+                    f"min {lot_plan.minimum_order_shares:.0f} shares = ${lot_plan.minimum_cost_usd:.2f} "
+                    f"@ cap ${price_cap:.3f}; raw Kelly ${trade_amount:.2f}; "
+                    f"max ${self.strategy_config.max_bet:.2f}; ratio {self._min_size_kelly_ratio:.1f}x"
+                )
+                btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
+                self.tracker.log_signal(
+                    window_ts=self._current_window,
+                    btc_price=btc_approx,
+                    opening_price=self._opening_price,
+                    up_price=self._cached_up,
+                    down_price=self._cached_down,
+                    seconds_remaining=seconds_remaining,
+                    side=sig.side,
+                    true_prob=sig.true_prob,
+                    market_price=actual_price,
+                    edge=actual_edge,
+                    kelly_size=trade_amount,
+                    markov_persistence=sig.markov_persistence,
+                    fee_rate_bps=sig.fee_rate_bps,
+                    fee_adjusted_edge=actual_fee_edge,
+                    action="skipped_minimum_share_lot",
+                    skip_reason=lot_plan.reason,
+                    actual_price=actual_price,
+                    actual_edge=actual_edge,
+                )
+                return
+
+            if abs(lot_plan.amount_usd - trade_amount) > 0.005:
+                print(
+                    f"  ℹ️  Minimum-share lot sizing: raw Kelly ${trade_amount:.2f} → "
+                    f"{lot_plan.shares} shares / ${lot_plan.amount_usd:.2f} "
+                    f"({lot_plan.reason}; min {lot_plan.minimum_order_shares:.0f} shares)"
+                )
+            trade_amount = lot_plan.amount_usd
+            sig.kelly_size = trade_amount
+            planned_order_notional_usd = lot_plan.amount_usd
+            sizing_reason = lot_plan.reason
+            planned_shares = float(lot_plan.shares)
+            _planned_spend = lot_plan.amount_usd
+            entry_snapshot = None
+            current_sell_price = 0.0
+            if self._orderbook_cache_enabled and planned_shares > 0:
+                get_entry_snapshot = getattr(self.orderbook_cache, "get_entry_snapshot", None)
+                if callable(get_entry_snapshot):
+                    entry_snapshot = get_entry_snapshot(
+                        token_id,
+                        buy_usd_amount=trade_amount,
+                        sell_shares_amount=planned_shares,
+                        required_buy_shares=planned_shares,
+                        cap_price=price_cap,
+                    )
+                    depth_snapshot = getattr(entry_snapshot, "depth", None)
+                    current_sell_price = float(getattr(entry_snapshot, "executable_sell_price", 0.0) or 0.0)
+                    executable_buy_price = float(getattr(entry_snapshot, "executable_buy_price", 0.0) or 0.0)
+                    if executable_buy_price > 0 and executable_buy_price != actual_price:
+                        actual_price = executable_buy_price
+                else:
+                    depth_snapshot = self.orderbook_cache.get_buy_depth_snapshot(
+                        token_id,
+                        required_shares=planned_shares,
+                        cap_price=price_cap,
+                    )
+                if depth_snapshot is None:
+                    print("  ⚠️  Atomic CLOB snapshot unavailable before FAK entry — skipping")
+                    return
+                print(
+                    f"  📚 Atomic book: depth≤cap {depth_snapshot.cumulative_shares:.0f}/"
                     f"{planned_shares:.0f} shares | best ask ${depth_snapshot.best_ask:.3f} "
-                    f"| worst ${depth_snapshot.worst_price:.3f} | age {depth_snapshot.book_age_ms:.0f}ms"
+                    f"| worst ${depth_snapshot.worst_price:.3f} | sell ${current_sell_price:.3f} "
+                    f"| age {depth_snapshot.book_age_ms:.0f}ms"
                 )
                 if not depth_snapshot.enough:
                     btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
@@ -1620,62 +1816,17 @@ class PolyBot:
                     print("  ⚠️  Liquidity gone before FAK entry — skipping")
                     return
 
-            latest_btc, latest_fresh = self.price_feed.get_price()
-            if latest_fresh and self._opening_price > 0 and latest_btc > 0:
-                # Final hot-path recheck uses raw Binance only. Do not apply a
-                # Source risk is handled by SourceConsensusGate against RTDS Binance/Chainlink directly.
-                latest_delta_pct = (latest_btc - self._opening_price) / self._opening_price * 100
-                latest_side = "UP" if latest_btc >= self._opening_price else "DOWN"
-                recheck_vol = self._compute_realized_vol()
-                latest_our_prob = probability_for_held_side(
-                    latest_delta_pct,
-                    seconds_remaining,
-                    sig.side,
-                    vol=recheck_vol,
-                )
-                if latest_side != sig.side or latest_our_prob < self.strategy_config.min_prob:
-                    if latest_side != sig.side:
-                        action = "skipped_btc_reversed"
-                        skip_reason = "btc_reversed_before_entry"
-                        message = "BTC reversed before entry"
-                    else:
-                        action = "skipped_prob_below_min"
-                        skip_reason = "prob_below_min_at_final_recheck"
-                        message = "Final recheck probability fell below min before entry"
-                    print(
-                        f"  ⚠️  {message} — skipping "
-                        f"(now {latest_side}, prob={latest_our_prob:.2f}, "
-                        f"min={self.strategy_config.min_prob:.2f}, vol={recheck_vol:.4f}, "
-                        f"Δ={latest_delta_pct:+.3f}%)"
-                    )
-                    self.tracker.log_signal(
-                        window_ts=self._current_window,
-                        btc_price=latest_btc,
-                        opening_price=self._opening_price,
-                        up_price=self._cached_up,
-                        down_price=self._cached_down,
-                        seconds_remaining=seconds_remaining,
-                        side=sig.side,
-                        true_prob=latest_our_prob,
-                        market_price=price_cap,
-                        edge=latest_our_prob - price_cap,
-                        kelly_size=sig.kelly_size,
-                        markov_persistence=sig.markov_persistence,
-                        fee_rate_bps=sig.fee_rate_bps,
-                        fee_adjusted_edge=fee_adjusted_edge(latest_our_prob, price_cap, sig.fee_rate_bps),
-                        action=action,
-                        skip_reason=skip_reason,
-                        actual_price=price_cap,
-                        actual_edge=latest_our_prob - price_cap,
-                    )
-                    return
+            # No final Binance recheck here. The signal has already been built
+            # from official-open anchored Chainlink, and source risk is handled by
+            # SourceConsensusGate. A last-millisecond Binance veto both adds
+            # latency and can reject the correct settlement-side trade.
 
             exit_probe = max(trade_amount, self._market_min_order_size, 1.0)
-            current_sell_price = (
-                self.orderbook_cache.get_market_price(token_id, "SELL", exit_probe)
-                if self._orderbook_cache_enabled
-                else self.executor.get_market_price(token_id, "SELL", exit_probe)
-            )
+            if current_sell_price <= 0:
+                current_sell_price = (
+                    0.0 if self._orderbook_cache_enabled
+                    else self.executor.get_market_price(token_id, "SELL", exit_probe)
+                )
             if current_sell_price > 0:
                 spread = price_cap - current_sell_price
                 if spread > self._entry_max_spread or current_sell_price < self._entry_min_exit_price:
@@ -1715,12 +1866,35 @@ class PolyBot:
         # its ~250ms pre-signing balance GET (no position open yet this window →
         # hint == real balance). Falls back to a live fetch when <=0.
         balance_hint = self._last_real_balance if self._last_real_balance > 0 else self.stats.bankroll
-        result = self.executor.buy(
-            token_id=token_id, amount_usd=trade_amount, price=hint_price,
-            balance_hint=balance_hint,
-        )
+        latency_timing = {
+            "signal_ready_ts": t_fak_submit,
+            "final_book_snapshot_ts": float(getattr(entry_snapshot, "snapshot_ts", 0.0) or 0.0),
+            "book_age_ms": float(getattr(depth_snapshot, "book_age_ms", 0.0) or 0.0),
+            "book_hash": str(getattr(entry_snapshot, "book_hash", "") or ""),
+            "sdk_warmed": bool(self._sdk_metadata_warmed),
+        }
+        try:
+            result = self.executor.buy(
+                token_id=token_id, amount_usd=trade_amount, price=hint_price,
+                balance_hint=balance_hint, timing=latency_timing,
+            )
+        except TypeError:
+            # Test doubles / older executors may not expose the new timing kwarg.
+            result = self.executor.buy(
+                token_id=token_id, amount_usd=trade_amount, price=hint_price,
+                balance_hint=balance_hint,
+            )
 
         if result.success:
+            result.raw_kelly_usd = raw_kelly_usd
+            if planned_order_notional_usd <= 0:
+                planned_order_notional_usd = round(result.shares * result.price, 2)
+            result.planned_order_notional_usd = result.planned_order_notional_usd or planned_order_notional_usd
+            result.actual_cash_spent_usd = result.actual_cash_spent_usd or result.amount_usd
+            result.estimated_fee_usd = result.estimated_fee_usd or max(
+                0.0, result.actual_cash_spent_usd - result.planned_order_notional_usd
+            )
+            result.sizing_reason = result.sizing_reason or sizing_reason
             self._consecutive_buy_failures = 0  # Reset circuit breaker
             self._traded = True
             self._trade_side = sig.side
@@ -1736,7 +1910,7 @@ class PolyBot:
             )
 
             self.stats.bankroll -= result.amount_usd
-            self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct)
+            self.stats.hourly.record_trade(sig.edge, sig.btc_delta_pct, entry_price=result.price)
 
             btc_approx = self._opening_price * (1 + sig.btc_delta_pct / 100) if self._opening_price > 0 else 0
             self.tracker.log_signal(
@@ -1781,17 +1955,39 @@ class PolyBot:
                 entry_delta_pct=sig.btc_delta_pct,
                 entry_seconds_remaining=seconds_remaining,
                 mode="DRY" if self.dry_run else "LIVE",
+                entry_signal_source=getattr(sig, "entry_signal_source", "polymarket_rtds_chainlink" if source_decision.chainlink_price else "binance_fallback"),
+                entry_signal_price=getattr(sig, "entry_signal_price", source_decision.signal_price or 0.0),
+                entry_signal_open_price=getattr(sig, "entry_signal_open_price", self._chainlink_open_price if source_decision.chainlink_price else self._opening_price),
+                entry_signal_delta_pct=getattr(sig, "entry_signal_delta_pct", sig.btc_delta_pct),
+                entry_chainlink_price=source_decision.chainlink_price or getattr(sig, "entry_chainlink_price", 0.0) or 0.0,
+                entry_chainlink_delta_pct=source_decision.chainlink_delta_pct or getattr(sig, "entry_chainlink_delta_pct", 0.0) or 0.0,
+                entry_rtds_binance_price=source_decision.rtds_binance_price or getattr(sig, "entry_rtds_binance_price", 0.0) or 0.0,
+                entry_rtds_binance_delta_pct=source_decision.rtds_binance_delta_pct or getattr(sig, "entry_rtds_binance_delta_pct", 0.0) or 0.0,
+                raw_kelly_usd=raw_kelly_usd,
+                planned_order_notional_usd=result.planned_order_notional_usd,
+                actual_cash_spent_usd=result.actual_cash_spent_usd,
+                estimated_fee_usd=result.estimated_fee_usd,
+                sizing_reason=result.sizing_reason,
             )
 
             mode = "PAPER" if self.dry_run else "LIVE"
             print(f"  ✅ {mode}: {result.shares:.0f} shares @ "
                   f"${result.price:.3f} = ${result.amount_usd:.2f}")
-            print(f"     Exit policy: hold to resolution")
+            print(
+                f"     Exit policy: "
+                f"{'price-stop @ ' + format(self._stop_loss_price_fraction, '.0%') + ' of entry' if self._stop_loss_enabled else 'hold to resolution'}"
+            )
 
             self.telegram.trade_alert(
                 side=sig.side, price=result.price, amount=result.amount_usd,
                 market_slug=slug, dry_run=self.dry_run,
                 edge=sig.edge, kelly_size=sig.kelly_size,
+                raw_kelly_usd=raw_kelly_usd,
+                planned_order_notional_usd=result.planned_order_notional_usd,
+                actual_cash_spent_usd=result.actual_cash_spent_usd,
+                estimated_fee_usd=result.estimated_fee_usd,
+                shares=result.shares,
+                sizing_reason=result.sizing_reason,
             )
         else:
             if result.error == "UNVERIFIED_BUY":
@@ -1805,6 +2001,31 @@ class PolyBot:
                 self._pending_buy_edge = sig.edge
                 self._pending_buy_delta = sig.btc_delta_pct
                 self._balance_before_buy = self.stats.bankroll
+                # Snapshot the full entry context NOW — sig/source_decision are
+                # out of scope by the next window boundary. Shares/cost/notional/
+                # fee are deliberately omitted: they get filled from the ACTUAL
+                # wallet delta when the late fill is detected.
+                self._pending_buy_entry = {
+                    "window_ts": self._current_window,
+                    "side": sig.side,
+                    "entry_price": result.price,
+                    "edge": sig.edge,
+                    "prob": sig.true_prob,
+                    "btc_delta": sig.btc_delta_pct,
+                    "seconds_remaining": seconds_remaining,
+                    "entry_delta_pct": sig.btc_delta_pct,
+                    "entry_seconds_remaining": seconds_remaining,
+                    "entry_signal_source": getattr(sig, "entry_signal_source", "polymarket_rtds_chainlink" if source_decision.chainlink_price else "binance_fallback"),
+                    "entry_signal_price": getattr(sig, "entry_signal_price", source_decision.signal_price or 0.0),
+                    "entry_signal_open_price": getattr(sig, "entry_signal_open_price", self._chainlink_open_price if source_decision.chainlink_price else self._opening_price),
+                    "entry_signal_delta_pct": getattr(sig, "entry_signal_delta_pct", sig.btc_delta_pct),
+                    "entry_chainlink_price": source_decision.chainlink_price or getattr(sig, "entry_chainlink_price", 0.0) or 0.0,
+                    "entry_chainlink_delta_pct": source_decision.chainlink_delta_pct or getattr(sig, "entry_chainlink_delta_pct", 0.0) or 0.0,
+                    "entry_rtds_binance_price": source_decision.rtds_binance_price or getattr(sig, "entry_rtds_binance_price", 0.0) or 0.0,
+                    "entry_rtds_binance_delta_pct": source_decision.rtds_binance_delta_pct or getattr(sig, "entry_rtds_binance_delta_pct", 0.0) or 0.0,
+                    "raw_kelly_usd": raw_kelly_usd,
+                    "sizing_reason": result.sizing_reason or sizing_reason,
+                }
                 print(f"  ⏳ Buy sent but unverified — will detect via balance sync")
             else:
                 print(f"  ❌ Buy failed: {result.error}")
@@ -2052,9 +2273,6 @@ class PolyBot:
                 self.tracker.stash_pending_trade(window_ts)
                 return
 
-        if won is None:
-            return
-
         self._record_resolution(
             won=won,
             original_cost=original_cost,
@@ -2282,9 +2500,10 @@ class PolyBot:
             trades=o["total_trades"],
             wins=o["wins"],
             losses=o["losses"],
-            avg_entry_price=self.stats.hourly.avg_edge,   # proxy via hourly stats
-            avg_edge=self.stats.hourly.avg_edge,
-            avg_delta=self.stats.hourly.avg_delta,
+            # Session-lifetime averages from the trade CSVs (live + dry). NOT
+            # self.stats.hourly.*, which resets every hour and would cover only
+            # the final partial hour while the counts above are lifetime.
+            **self.tracker.session_trade_averages(),
         )
 
         time.sleep(1)

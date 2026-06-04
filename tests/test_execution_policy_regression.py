@@ -3,13 +3,62 @@ import bot
 from executor import Executor, FILLED, OrderResult
 
 
-def test_stop_loss_code_is_removed_for_hold_to_resolution(monkeypatch, tmp_path):
+def test_price_stop_loss_is_active_and_configurable(monkeypatch, tmp_path):
     monkeypatch.setenv("DRY_RUN", "true")
     monkeypatch.setenv("LOG_DIR", str(tmp_path))
+    monkeypatch.delenv("STOP_LOSS_ENABLED", raising=False)
+    monkeypatch.delenv("STOP_LOSS_PRICE_FRACTION", raising=False)
 
     polybot = bot.PolyBot()
 
-    assert not hasattr(polybot, "_stop_loss_enabled")
+    assert polybot._stop_loss_enabled is True
+    assert polybot._stop_loss_price_fraction == 0.50
+
+
+def test_price_stop_exits_when_sell_price_drops_50pct(monkeypatch, tmp_path):
+    monkeypatch.setenv("DRY_RUN", "true")
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))
+    polybot = bot.PolyBot()
+    polybot._opening_price = 100.0
+    polybot._chainlink_open_price = 100.0
+    polybot._traded = True
+    polybot._trade_side = "DOWN"
+    polybot._trade_price = 0.80
+    polybot._trade_cost = 4.00
+    polybot._trade_shares = 5.0
+    polybot._trade_token_id = "tok-down"
+    polybot._last_position_check = 0.0
+
+    class NoChainlink:
+        def get_latest(self):
+            return None
+
+    exits = []
+    resolutions = []
+    polybot.rtds_feed = NoChainlink()
+    monkeypatch.setattr(polybot.tracker, "update_hold_stats", lambda prob, price: None)
+    monkeypatch.setattr(
+        polybot.tracker,
+        "log_trade_exit",
+        lambda **kwargs: exits.append(kwargs),
+    )
+    monkeypatch.setattr(
+        polybot,
+        "_record_resolution",
+        lambda **kwargs: resolutions.append(kwargs),
+    )
+
+    # DOWN held, but BTC has ripped above open; held-side probability/sell price
+    # collapses below 50% of 0.80 entry, so the price stop must fire.
+    polybot._manage_position(btc_price=101.0, seconds_remaining=120.0, now=1000.0)
+
+    assert exits
+    assert exits[0]["exit_type"] == "price-stop"
+    assert exits[0]["exit_price"] <= 0.40
+    assert resolutions
+    assert resolutions[0]["resolution_method"] == "price_stop_50pct"
+    assert resolutions[0]["remaining_shares"] == 0.0
+    assert polybot._traded is False
 
 
 def test_directional_probability_for_down_uses_brownian_current_direction():

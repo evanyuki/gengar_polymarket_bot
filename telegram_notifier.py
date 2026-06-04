@@ -2,7 +2,6 @@
 
 import os
 import urllib.request
-import urllib.parse
 import json
 import threading
 
@@ -38,13 +37,37 @@ class TelegramNotifier:
         except Exception as e:
             print(f"[telegram] Failed to send: {e}")
 
-    def trade_alert(self, side: str, price: float, amount: float, market_slug: str, dry_run: bool, edge: float = 0, kelly_size: float = 0):
+    def trade_alert(
+        self,
+        side: str,
+        price: float,
+        amount: float,
+        market_slug: str,
+        dry_run: bool,
+        edge: float = 0,
+        kelly_size: float = 0,
+        raw_kelly_usd: float = 0.0,
+        planned_order_notional_usd: float = 0.0,
+        actual_cash_spent_usd: float = 0.0,
+        estimated_fee_usd: float = 0.0,
+        shares: float = 0.0,
+        sizing_reason: str = "",
+    ):
         mode = "PAPER" if dry_run else "LIVE"
+        raw_kelly = raw_kelly_usd if raw_kelly_usd > 0 else kelly_size
+        planned = planned_order_notional_usd if planned_order_notional_usd > 0 else amount
+        cash = actual_cash_spent_usd if actual_cash_spent_usd > 0 else amount
+        fee = max(0.0, estimated_fee_usd)
+        share_text = f"{shares:.0f}" if shares and abs(shares - round(shares)) < 1e-9 else f"{shares:.2f}"
         self.send(
             f"{'📝' if dry_run else '🔔'} *{mode} TRADE*\n"
             f"Side: *{side}*\n"
             f"Price: ${price:.4f}\n"
-            f"Amount: ${amount:.2f} (Kelly: ${kelly_size:.2f})\n"
+            f"Cash spent: ${cash:.2f} incl fee\n"
+            f"Raw Kelly: ${raw_kelly:.2f}\n"
+            f"Order: {share_text} shares @ ${price:.4f} = ${planned:.2f}\n"
+            f"Fee est: ${fee:.2f}\n"
+            f"Sizing: {sizing_reason or 'raw_kelly_or_live_lot'}\n"
             f"Edge: {edge*100:.1f}%\n"
             f"Market: `{market_slug}`"
         )
@@ -134,6 +157,7 @@ class TelegramNotifier:
             f"Mode: *{'DRY RUN' if config.get('dry_run') else 'LIVE'}*\n"
             f"Kelly fraction: {kelly*100:.0f}%\n"
             f"Min edge: {config.get('min_edge', 0)*100:.1f}%\n"
-            f"Bet range: ${config.get('min_bet', 1):.0f}–${config.get('max_bet', 25):.0f}\n"
+            f"Max bet: ${config.get('max_bet', 25):.0f} | "
+            f"CLOB min lot: {config.get('minimum_order_shares', 5):.0f} shares\n"
             f"Entry: T-{config.get('entry_start', 60)}s to T-{config.get('entry_end', 10)}s"
         )

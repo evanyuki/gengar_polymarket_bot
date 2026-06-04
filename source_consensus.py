@@ -1,8 +1,9 @@
 """RTDS source-consensus risk gate for BTC Up/Down markets.
 
 Do not manufacture an oracle by applying a rolling Binance/Chainlink basis.
-The trade signal uses fast Binance. Risk validation compares current Polymarket
-RTDS Binance and RTDS Chainlink prices directly.
+The live trade signal is anchored to Polymarket/Chainlink official openPrice
+plus current RTDS Chainlink. RTDS Binance is logged as diagnostic context only;
+it must not veto or downsize Chainlink-confirmed live entries.
 """
 
 from __future__ import annotations
@@ -29,38 +30,18 @@ class RtdsPrice:
 class SourceConsensusConfig:
     enabled: bool = True
     require_chainlink: bool = True
-    require_rtds_binance: bool = False
-    stale_downsize_seconds: float = 10.0
     stale_skip_seconds: float = 30.0
-    downsize_factor: float = 0.50
-    # Abnormal RTDS Binance-vs-Chainlink split guard. This is not a
-    # Chainlink-confirmation threshold: normal oracle-lag regimes can show a
-    # directional gap. Keep local/direct Binance-vs-RTDS Binance as the strict
-    # feed-integrity gate and classify RTDS-vs-Chainlink lag separately.
-    max_rtds_source_gap_bps: float = 25.0
-    max_direct_vs_rtds_binance_gap_bps: float = 6.0
     # Settlement-source confirmation gate. The 5m BTC Up/Down rules resolve
-    # from Chainlink BTC/USD, so a Binance-led signal is not tradable unless
-    # Chainlink is already on the intended side and far enough from open to
-    # avoid the near-zero coin-flip zone.
-    min_chainlink_delta_pct: float = 0.02
-    # Binance trades structurally ~14.5bps above Chainlink — a near-constant
-    # basis, NOT lag. The raw source_gap therefore rests near +basis, which made
-    # the lag-direction test flag EVERY DOWN signal as "adverse" (gap>0) and
-    # EVERY UP as "aligned", firing a downsize on every DOWN for no real reason.
-    # De-bias the gap by the basis so the lag test measures only the EXCESS
-    # lead (true lag), and tolerate a deadband so it bites only on genuinely
-    # anomalous lag. This de-biases a diagnostic heuristic; it does NOT
-    # fabricate a settlement price (see module header warning).
-    binance_chainlink_basis_bps: float = 14.5
-    lag_adverse_deadband_bps: float = 5.0
+    # from Chainlink BTC/USD, so a signal is tradable only when Chainlink is on
+    # the intended side and far enough from open to avoid the near-zero coin-flip zone.
+    min_chainlink_delta_pct: float = 0.07
+
 
 
 @dataclass
 class SourceConsensusDecision:
-    action: str  # "normal", "downsize", "skip"
+    action: str  # "normal", "skip"
     reason: str
-    size_multiplier: float
     signal_price: float
     signal_side: str
     chainlink_price: Optional[float]
@@ -237,7 +218,7 @@ class SourceConsensusGate:
         with self._lock:
             snapshot = self._latest_snapshot
         if snapshot is None:
-            return self._decision("skip", "source_snapshot_missing", 0.0, 0.0, intended_side, None, None, None, None)
+            return self._decision("skip", "source_snapshot_missing", 0.0, intended_side, None, None, None, None)
         if snapshot.signal_side != intended_side.upper():
             chainlink = (
                 RtdsPrice(snapshot.chainlink_price, "snapshot", time.time(), snapshot.chainlink_age_seconds or 0.0)
@@ -250,7 +231,6 @@ class SourceConsensusGate:
             return self._decision(
                 "skip",
                 "source_snapshot_side_disagrees",
-                0.0,
                 snapshot.signal_price,
                 snapshot.signal_side,
                 chainlink,
@@ -270,89 +250,55 @@ class SourceConsensusGate:
         rtds_binance: Optional[RtdsPrice] = None,
         binance_opening_price: Optional[float] = None,
     ) -> SourceConsensusDecision:
-        # `opening_price` is the Chainlink/Polymarket settlement open (used for
-        # the Chainlink side/distance checks). `binance_opening_price` is the
-        # Binance window-open used to de-bias the Binance/RTDS-Binance side. They
-        # differ by a near-constant Binance-vs-Chainlink basis (~14bps); anchoring
-        # the Binance side to the Chainlink open would inject that basis as a fake
-        # directional signal. Falls back to opening_price for backward compat.
-        signal_price = float(binance_price or 0.0)
-        binance_open = (
-            float(binance_opening_price)
-            if binance_opening_price and binance_opening_price > 0
-            else float(opening_price or 0.0)
-        )
-        signal_side = "UP" if signal_price >= binance_open else "DOWN"
         intended_side = intended_side.upper()
+        signal_price = float(chainlink.price if chainlink else (binance_price or 0.0))
+        signal_side = intended_side
 
         if not self.config.enabled:
-            return self._decision("normal", "source_consensus_disabled", 1.0, signal_price, signal_side, chainlink, rtds_binance)
-        if opening_price <= 0 or signal_price <= 0 or binance_open <= 0:
-            return self._decision("skip", "missing_price_for_source_consensus", 0.0, signal_price, signal_side, chainlink, rtds_binance)
-        if signal_side != intended_side:
-            return self._decision("skip", "fast_binance_side_disagrees", 0.0, signal_price, signal_side, chainlink, rtds_binance)
+            return self._decision("normal", "source_consensus_disabled", signal_price, signal_side, chainlink, rtds_binance)
+        if opening_price <= 0:
+            return self._decision("skip", "missing_price_for_source_consensus", signal_price, signal_side, chainlink, rtds_binance)
 
         direct_gap = None
-        if rtds_binance is None:
-            if self.config.require_rtds_binance:
-                return self._decision("skip", "missing_polymarket_rtds_binance", 0.0, signal_price, signal_side, chainlink, rtds_binance)
-        else:
-            rtds_side = "UP" if rtds_binance.price >= binance_open else "DOWN"
-            rtds_delta_pct = (rtds_binance.price - binance_open) / binance_open * 100.0
-            direct_gap = abs((signal_price - rtds_binance.price) / rtds_binance.price * 10000.0)
-            if rtds_binance.age_seconds > self.config.stale_skip_seconds:
-                return self._decision("skip", "polymarket_rtds_binance_stale", 0.0, signal_price, signal_side, chainlink, rtds_binance, direct_gap=direct_gap, rtds_delta_pct=rtds_delta_pct)
-            if rtds_side != intended_side:
-                return self._decision("skip", "polymarket_rtds_binance_side_disagrees", 0.0, signal_price, signal_side, chainlink, rtds_binance, direct_gap=direct_gap, rtds_delta_pct=rtds_delta_pct)
-            if direct_gap > self.config.max_direct_vs_rtds_binance_gap_bps:
-                return self._decision("skip", "direct_binance_vs_rtds_binance_gap_too_large", 0.0, signal_price, signal_side, chainlink, rtds_binance, direct_gap=direct_gap, rtds_delta_pct=rtds_delta_pct)
+        rtds_delta_pct = None
+        if rtds_binance is not None:
+            direct_ref = float(binance_price or 0.0)
+            if direct_ref > 0 and rtds_binance.price > 0:
+                direct_gap = abs((direct_ref - rtds_binance.price) / rtds_binance.price * 10000.0)
+            binance_open = (
+                float(binance_opening_price)
+                if binance_opening_price and binance_opening_price > 0
+                else float(opening_price or 0.0)
+            )
+            if binance_open > 0:
+                rtds_delta_pct = (rtds_binance.price - binance_open) / binance_open * 100.0
 
         if chainlink is None:
             if self.config.require_chainlink:
-                return self._decision("skip", "missing_polymarket_chainlink", 0.0, signal_price, signal_side, chainlink, rtds_binance, direct_gap=direct_gap)
-            return self._decision("downsize", "missing_chainlink_downsize", self.config.downsize_factor, signal_price, signal_side, chainlink, rtds_binance, direct_gap=direct_gap)
+                return self._decision("skip", "missing_polymarket_chainlink", signal_price, signal_side, chainlink, rtds_binance, direct_gap=direct_gap, rtds_delta_pct=rtds_delta_pct)
+            return self._decision("normal", "chainlink_not_required", signal_price, signal_side, chainlink, rtds_binance, direct_gap=direct_gap, rtds_delta_pct=rtds_delta_pct)
 
-        source_price = rtds_binance.price if rtds_binance is not None else signal_price
-        source_gap = (source_price - chainlink.price) / chainlink.price * 10000.0
         chainlink_delta_pct = (chainlink.price - opening_price) / opening_price * 100.0
-        rtds_delta_pct = (rtds_binance.price - binance_open) / binance_open * 100.0 if rtds_binance else None
+        chainlink_side = "UP" if chainlink_delta_pct >= 0.0 else "DOWN"
+        signal_price = chainlink.price
+        signal_side = chainlink_side
+        source_gap = ((rtds_binance.price - chainlink.price) / chainlink.price * 10000.0) if rtds_binance is not None else None
 
         if chainlink.age_seconds > self.config.stale_skip_seconds:
-            return self._decision("skip", "polymarket_chainlink_stale", 0.0, signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
-
-        chainlink_side = "UP" if chainlink_delta_pct >= 0.0 else "DOWN"
+            return self._decision("skip", "polymarket_chainlink_stale", signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
         if chainlink_side != intended_side:
-            return self._decision("skip", "chainlink_side_disagrees", 0.0, signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
+            return self._decision("skip", "chainlink_side_disagrees", signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
         if abs(chainlink_delta_pct) < self.config.min_chainlink_delta_pct:
-            return self._decision("skip", "chainlink_delta_too_close_to_open", 0.0, signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
+            return self._decision("skip", "chainlink_delta_too_close_to_open", signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
 
-        # Binance/RTDS remains a fast lead/momentum feature only. It can confirm
-        # that the market may still be repricing, but it cannot replace the
-        # Chainlink settlement-source direction and minimum distance checks.
-        if abs(source_gap) > self.config.max_rtds_source_gap_bps:
-            return self._decision("skip", "rtds_binance_chainlink_gap_too_large", 0.0, signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
-
-        # De-bias the constant Binance/Chainlink basis out of the lag test so it
-        # measures only the EXCESS lead, then tolerate a deadband so it downsizes
-        # only on genuinely anomalous lag, not the resting basis. Raw source_gap
-        # is kept for the abnormal-split guard above and for logging.
-        expected_lag_sign = 1.0 if intended_side == "UP" else -1.0
-        lag_excess_bps = source_gap - self.config.binance_chainlink_basis_bps
-        lag_aligned = (lag_excess_bps * expected_lag_sign) >= -self.config.lag_adverse_deadband_bps
-
-        if chainlink.age_seconds > self.config.stale_downsize_seconds:
-            return self._decision("downsize", "polymarket_chainlink_mildly_stale", self.config.downsize_factor, signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
-        if rtds_binance is not None and rtds_binance.age_seconds > self.config.stale_downsize_seconds:
-            return self._decision("downsize", "polymarket_rtds_binance_mildly_stale", self.config.downsize_factor, signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
-        if not lag_aligned:
-            return self._decision("downsize", "rtds_chainlink_lag_adverse", self.config.downsize_factor, signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
-        return self._decision("normal", "rtds_chainlink_lag_aligned", 1.0, signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
+        # Binance/RTDS is diagnostic only here. It must not veto or downsize a
+        # trade whose settlement-source Chainlink side and distance are valid.
+        return self._decision("normal", "chainlink_settlement_source_confirmed", signal_price, signal_side, chainlink, rtds_binance, source_gap, direct_gap, chainlink_delta_pct, rtds_delta_pct)
 
     def _decision(
         self,
         action: str,
         reason: str,
-        multiplier: float,
         signal_price: float,
         signal_side: str,
         chainlink: Optional[RtdsPrice],
@@ -365,7 +311,6 @@ class SourceConsensusGate:
         return SourceConsensusDecision(
             action=action,
             reason=reason,
-            size_multiplier=multiplier,
             signal_price=signal_price,
             signal_side=signal_side,
             chainlink_price=chainlink.price if chainlink else None,

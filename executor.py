@@ -5,15 +5,16 @@ keeps taker execution while avoiding the py-clob-client-v2 BUY market helper's
 amount/price float division path.
 """
 
+import csv
+import os
 import time
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-from typing import Optional
+from typing import Optional, Any
 
 from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import (
     OrderArgsV2,
-    MarketOrderArgsV2,
     OrderType,
     BalanceAllowanceParams,
     AssetType,
@@ -30,12 +31,14 @@ FAILED = "FAILED"
 MIN_SHARES = 1.0
 MIN_AMOUNT_USD = 1.0
 MAX_BUY_PRICE = 0.90
-POLY_MIN_NOTIONAL = 5.0
+POLY_MIN_ORDER_SHARES = 5.0
 
 
 @dataclass
 class MarketMetadata:
-    minimum_order_size: float = POLY_MIN_NOTIONAL
+    # Polymarket CLOB `minimum_order_size` is a share count, not a fixed USDC
+    # notional. BTC 5m markets commonly return 5, meaning 5 outcome tokens.
+    minimum_order_size: float = POLY_MIN_ORDER_SHARES
     minimum_tick_size: float = 0.01
     fee_rate_bps: float = 0.0
     # CLOB fee = (amount/price) * rate * (p*(1-p))**exponent. Verified live
@@ -60,11 +63,52 @@ class OrderResult:
     token_id: str = ""
     error: str = ""
     dry_run: bool = True
+    # Accounting semantics. Keep raw model sizing, planned order notional, and
+    # wallet cashflow separate. Polymarket fees make cash spent > shares*price;
+    # never infer token shares from fee-inclusive cash spent.
+    raw_kelly_usd: float = 0.0
+    planned_order_notional_usd: float = 0.0
+    actual_cash_spent_usd: float = 0.0
+    estimated_fee_usd: float = 0.0
+    sizing_reason: str = ""
+    # Hot-path latency breakdown (ms). bal = pre-sign collateral GET (0 when a
+    # balance_hint skips it), sign = create_order EIP-712 build, post = post_order
+    # round-trip (network + server-side FAK match, inseparable client-side),
+    # submit_ack = sign + post = the controllable book-read -> order-land window.
+    bal_ms: float = 0.0
+    sign_ms: float = 0.0
+    post_ms: float = 0.0
+    submit_ack_ms: float = 0.0
+
+
+@dataclass
+class MinimumLotPlan:
+    executable: bool
+    reason: str
+    shares: int = 0
+    amount_usd: float = 0.0
+    raw_kelly_usd: float = 0.0
+    minimum_order_shares: float = 0.0
+    minimum_cost_usd: float = 0.0
 
 
 def _decimal_from_float(value: float | int | str) -> Decimal:
     """Convert numeric inputs through str() so 0.59 stays Decimal('0.59')."""
     return Decimal(str(value))
+
+
+def _fmt_ts(value) -> str:
+    try:
+        return f"{float(value):.6f}"
+    except Exception:
+        return ""
+
+
+def _fmt_float(value) -> str:
+    try:
+        return f"{float(value):.1f}"
+    except Exception:
+        return ""
 
 
 def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
@@ -93,6 +137,69 @@ def calculate_order_size(price: float, max_usd: float) -> tuple[float, float]:
     if shares < MIN_SHARES or spend_dec <= 0:
         return 0.0, 0.0
     return float(shares), float(spend_dec)
+
+
+def plan_minimum_lot_order(
+    *,
+    price: float,
+    raw_kelly_usd: float,
+    minimum_order_shares: float,
+    max_bet_usd: float,
+    max_floor_to_kelly_ratio: float,
+) -> MinimumLotPlan:
+    """Plan a Polymarket minimum-share-lot BUY.
+
+    The CLOB minimum is a share count. With small bankrolls, fractional Kelly
+    often produces a dollar budget below the executable 5-share floor. Treat
+    Kelly as a sanity check, then size in whole shares.
+    """
+    raw_kelly_usd = round(float(raw_kelly_usd or 0.0), 2)
+    price_dec = _decimal_from_float(price).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    min_shares = int(float(minimum_order_shares or 0.0))
+    max_bet_usd = round(float(max_bet_usd or 0.0), 2)
+    ratio = float(max_floor_to_kelly_ratio or 0.0)
+
+    if price_dec <= 0 or min_shares <= 0 or max_bet_usd <= 0:
+        return MinimumLotPlan(False, "invalid_minimum_lot_inputs", raw_kelly_usd=raw_kelly_usd)
+    if raw_kelly_usd <= 0:
+        return MinimumLotPlan(False, "kelly_size_zero", raw_kelly_usd=raw_kelly_usd)
+
+    minimum_cost_dec = (Decimal(min_shares) * price_dec).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    minimum_cost = float(minimum_cost_dec)
+    if minimum_cost > max_bet_usd + 1e-9:
+        return MinimumLotPlan(
+            False,
+            "minimum_share_lot_exceeds_max_bet",
+            raw_kelly_usd=raw_kelly_usd,
+            minimum_order_shares=float(min_shares),
+            minimum_cost_usd=minimum_cost,
+        )
+    if ratio > 0 and minimum_cost > raw_kelly_usd * ratio + 1e-9:
+        return MinimumLotPlan(
+            False,
+            "minimum_share_lot_exceeds_kelly_ratio",
+            raw_kelly_usd=raw_kelly_usd,
+            minimum_order_shares=float(min_shares),
+            minimum_cost_usd=minimum_cost,
+        )
+
+    budget = min(max_bet_usd, max(minimum_cost, raw_kelly_usd))
+    shares, spend = calculate_order_size(float(price_dec), budget)
+    shares_i = int(shares)
+    if shares_i < min_shares:
+        shares_i = min_shares
+        spend = minimum_cost
+
+    reason = "minimum_share_lot" if spend <= raw_kelly_usd + 1e-9 else "raised_to_minimum_share_lot"
+    return MinimumLotPlan(
+        True,
+        reason,
+        shares=shares_i,
+        amount_usd=round(float(spend), 2),
+        raw_kelly_usd=raw_kelly_usd,
+        minimum_order_shares=float(min_shares),
+        minimum_cost_usd=minimum_cost,
+    )
 
 
 def _is_fak_no_fill_error(exc: Exception) -> bool:
@@ -132,7 +239,7 @@ class Executor:
         self.safe_address = safe_address
         self.client: Optional[ClobClient] = None
         self._initialized = False
-        self.min_order_size = POLY_MIN_NOTIONAL
+        self.min_order_size = POLY_MIN_ORDER_SHARES
         self.tick_size = 0.01
         self.fee_rate_bps = 0.0
         self._tor_active = False
@@ -209,7 +316,7 @@ class Executor:
             return MarketMetadata()
         try:
             info = self.client.get_clob_market_info(condition_id)
-            mos = float(info.get("mos") or POLY_MIN_NOTIONAL)
+            mos = float(info.get("mos") or POLY_MIN_ORDER_SHARES)
             mts = float(info.get("mts") or 0.01)
             fd = info.get("fd") or {}
             fee_rate = float(fd.get("r") or 0.0)
@@ -251,6 +358,53 @@ class Executor:
         bounded = max(min_price, min(max_price, rounded))
         return float(bounded)
 
+    def _estimate_fee(self, shares: float, price: float) -> float:
+        """Mirror the live CLOB fee formula: fee = shares * rate * p * (1 - p).
+
+        Same model as strategy.effective_market_price (per-share fee =
+        feeRate * p * (1-p)). With fee_rate_bps == 0 (current BTC 5m) this is
+        0.0; it tracks automatically if Polymarket turns fees on, so a dry-run
+        fill carries the same fee drag a live fill would.
+        """
+        fee_rate = max(0.0, float(self.fee_rate_bps or 0.0)) / 10_000.0
+        return round(float(shares) * fee_rate * price * (1.0 - price), 2)
+
+    def _size_buy_or_reject(
+        self, token_id: str, market_price: float, amount_usd: float,
+    ) -> tuple[float, float, Optional[OrderResult]]:
+        """Cap + integer-share sizing + minimum-lot gate, shared by DRY and LIVE.
+
+        Returns (shares, planned_spend, None) when executable, else
+        (0.0, 0.0, <rejecting OrderResult>). Keeping this identical for both
+        modes guarantees a dry-run fill is only logged for an order the live
+        path would also have accepted (same price cap, same share minimum, same
+        integer-share rounding).
+        """
+        if market_price > MAX_BUY_PRICE:
+            return 0.0, 0.0, OrderResult(
+                success=False, status=REJECTED,
+                error=f"Price ${market_price:.3f} > cap ${MAX_BUY_PRICE:.2f}",
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+            )
+
+        shares, planned_spend = calculate_order_size(market_price, amount_usd)
+        if shares < 1 or planned_spend <= 0:
+            return 0.0, 0.0, OrderResult(
+                success=False, status=REJECTED,
+                error=f"Can't afford 1 share at ${market_price:.3f} "
+                      f"within ${amount_usd:.2f}",
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+            )
+
+        if shares < self.min_order_size:
+            return 0.0, 0.0, OrderResult(
+                success=False, status=REJECTED,
+                error=f"Size {shares:.0f} shares < {self.min_order_size:.0f} min",
+                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+            )
+
+        return shares, planned_spend, None
+
     def get_market_price(self, token_id: str, side: str, amount_usd: float) -> float:
         if not self._initialized or not self.client:
             return 0.0
@@ -268,18 +422,45 @@ class Executor:
                 print(f"[executor] Price check failed: {sanitize_exception_text(e)}")
             return 0.0
 
-    def get_fee_rate_bps(self, token_id: str) -> float:
-        """Return CLOB v2 fee rate in basis points for token metadata."""
-        if not self._initialized or not self.client or not token_id:
-            return 0.0
+    def warm_order_metadata(self, token_ids: list[str] | tuple[str, ...] | set[str]) -> dict[str, Any]:
+        """Prime SDK metadata/version caches at new-window time, outside buy hot path.
+
+        py-clob-client-v2 resolves tick size, neg-risk and signing version lazily.
+        Let that happen when the market rolls, not between signal_ready and FAK POST.
+        This method does not sign or post orders.
+        """
+        status: dict[str, Any] = {"ok": False, "tokens": 0, "errors": []}
+        if not self._initialized or not self.client:
+            status["errors"].append("not_initialized")
+            return status
+        warmed = 0
         try:
-            return float(self.client.get_fee_rate_bps(token_id))
+            resolver = getattr(self.client, "_ClobClient__resolve_version", None)
+            if callable(resolver):
+                resolver()
         except Exception as e:
-            print(f"[executor] Fee metadata check failed: {sanitize_exception_text(e)}")
-            return 0.0
+            status["errors"].append(f"version:{sanitize_exception_text(e)}")
+        for token_id in [str(t) for t in token_ids if t]:
+            try:
+                tick = self.client.get_tick_size(token_id)
+                if tick:
+                    self.tick_size = float(tick)
+            except Exception as e:
+                status["errors"].append(f"tick:{token_id[:8]}:{sanitize_exception_text(e)}")
+            try:
+                neg = self.client.get_neg_risk(token_id)
+                # The call is the warmup. Value is SDK-internal metadata; store
+                # nothing because the order builder asks SDK again when signing.
+                _ = neg
+            except Exception as e:
+                status["errors"].append(f"neg:{token_id[:8]}:{sanitize_exception_text(e)}")
+            warmed += 1
+        status["tokens"] = warmed
+        status["ok"] = warmed > 0 and not status["errors"]
+        return status
 
     def buy(self, token_id: str, amount_usd: float, price: float = 0.0,
-            balance_hint: float = -1.0) -> OrderResult:
+            balance_hint: float = -1.0, timing: Optional[dict[str, Any]] = None) -> OrderResult:
         """Buy with a marketable FAK limit order and explicit worst-price cap.
 
         This avoids BUY MarketOrderArgsV2(amount=USD), whose internal
@@ -297,21 +478,23 @@ class Executor:
                 error=f"Amount ${amount_usd:.2f} below min", side="BUY",
             )
 
-        if self.dry_run:
-            sim_price = round(float(price), 2) if price > 0 else 0.55
-            return OrderResult(
-                success=True, order_id=f"DRY-{int(time.time())}",
-                status=FILLED, side="BUY", price=sim_price,
-                amount_usd=amount_usd, shares=amount_usd / sim_price,
-                token_id=token_id[:16] + "...", dry_run=True,
-            )
-
-        if not self._initialized or not self.client:
-            return OrderResult(success=False, status=FAILED, error="Not initialized")
-
+        # Resolve the marketable price. DRY and LIVE share the sizing path below;
+        # they diverge ONLY here (DRY cannot probe the book, so it requires a
+        # caller-supplied price) and at the submit/verify step at the end.
         if price > 0:
             market_price = self._round_price_to_tick(price)
+        elif self.dry_run:
+            # No book probe in dry_run (no client). The live path resolves an
+            # unknown price via get_market_price(); dry_run cannot, so a missing
+            # caller price is a hard reject — never fabricate a fill price.
+            return OrderResult(
+                success=False, status=REJECTED,
+                error="DRY buy requires a caller-supplied price (no book probe)",
+                side="BUY", token_id=token_id[:16] + "...",
+            )
         else:
+            if not self._initialized or not self.client:
+                return OrderResult(success=False, status=FAILED, error="Not initialized")
             market_price = self.get_market_price(token_id, "BUY", amount_usd)
             if market_price <= 0:
                 return OrderResult(
@@ -321,32 +504,35 @@ class Executor:
                 )
             market_price = self._round_price_to_tick(market_price)
 
-        # Price cap: don't buy above MAX_BUY_PRICE
-        if market_price > MAX_BUY_PRICE:
+        # Shared cap + integer-share sizing + minimum-lot gate (identical DRY/LIVE).
+        shares, planned_spend, reject = self._size_buy_or_reject(
+            token_id, market_price, amount_usd,
+        )
+        if reject is not None:
+            return reject
+
+        if self.dry_run:
+            # Simulated fill: same shares/price/notional the live path would
+            # produce. estimated_fee mirrors the live fee formula; cash spent is
+            # notional + fee so a dry-run bankroll draw matches a live one.
+            planned_notional = planned_spend
+            estimated_fee = self._estimate_fee(shares, market_price)
+            cash_spent = round(planned_notional + estimated_fee, 2)
             return OrderResult(
-                success=False, status=REJECTED,
-                error=f"Price ${market_price:.3f} > cap ${MAX_BUY_PRICE:.2f}",
-                side="BUY", price=market_price, token_id=token_id[:16] + "...",
+                success=True, order_id=f"DRY-{int(time.time())}",
+                status=FILLED, side="BUY", price=market_price,
+                amount_usd=cash_spent, shares=float(int(shares)),
+                token_id=token_id[:16] + "...", dry_run=True,
+                planned_order_notional_usd=planned_notional,
+                actual_cash_spent_usd=cash_spent,
+                estimated_fee_usd=estimated_fee,
             )
 
-        shares, planned_spend = calculate_order_size(market_price, amount_usd)
-        if shares < 1 or planned_spend <= 0:
-            return OrderResult(
-                success=False, status=REJECTED,
-                error=f"Can't afford 1 share at ${market_price:.3f} "
-                      f"within ${amount_usd:.2f}",
-                side="BUY", price=market_price, token_id=token_id[:16] + "...",
-            )
+        if not self._initialized or not self.client:
+            return OrderResult(success=False, status=FAILED, error="Not initialized")
 
-        if shares < self.min_order_size:
-            return OrderResult(
-                success=False, status=REJECTED,
-                error=f"Size {shares:.0f} shares < {self.min_order_size:.0f} min",
-                side="BUY", price=market_price, token_id=token_id[:16] + "...",
-            )
-
-        print(f"  📊 Market price: ${market_price:.3f}/share "
-              f"→ {int(shares)} shares for ${planned_spend:.2f}")
+        # Do not print between final book snapshot and POST. Console I/O is small
+        # but pointless latency in the exact race window. Print after ack/fail.
 
         # Hot-path latency: get_collateral_balance() is a fresh ~250ms CLOB GET
         # on every order, in series before signing. With a caller hint (window-
@@ -355,10 +541,23 @@ class Executor:
         # is the window high-water balance (>= actual at submit, since balance
         # only drops on this buy), so the SDK fee-buffer never over-shrinks; the
         # post-order verify + window-boundary sync remain the source of truth.
+        bal_ms = 0.0
         if balance_hint > 0:
             balance_before = balance_hint
         else:
+            _b0 = time.perf_counter()
             balance_before = self.get_collateral_balance()
+            bal_ms = (time.perf_counter() - _b0) * 1000.0
+
+        # Latency instrumentation: the no-fills are a race — the book walks away
+        # between our book-read and our FAK landing at the matcher. Split the hot
+        # path into sign (local) vs post (network + match) so we know which part
+        # to cut. Vars live outside the try so the no-fill/error paths can log too.
+        sign_ms = 0.0
+        post_ms = 0.0
+        _post_started = False
+        timing = dict(timing or {})
+        timing.setdefault("executor_buy_start_ts", time.time())
 
         try:
             clob_order_type = OrderType.FAK
@@ -370,34 +569,78 @@ class Executor:
                 user_usdc_balance=balance_before,
             )
             try:
+                _s0 = time.perf_counter()
+                timing["sign_start_ts"] = time.time()
                 signed_order = self.client.create_order(order_args)
+                timing["sign_end_ts"] = time.time()
+                sign_ms = (time.perf_counter() - _s0) * 1000.0
+                _post_started = True
+                _p0 = time.perf_counter()
+                timing["post_start_ts"] = time.time()
                 result = self.client.post_order(signed_order, clob_order_type, False)
+                timing["post_end_ts"] = time.time()
+                post_ms = (time.perf_counter() - _p0) * 1000.0
             except Exception as post_exc:
+                # post_order raised (incl. FAK no-fill 400) — capture how long it
+                # took before re-raising, so the no-fill latency still gets logged.
+                if _post_started:
+                    timing.setdefault("post_end_ts", time.time())
+                    post_ms = (time.perf_counter() - _p0) * 1000.0
                 # Direct placement blocked by Cloudflare (403) — activate Tor
                 # for THIS order and re-submit once. Any other error (incl. FAK
                 # no-fill 400) falls through to the outer handler unchanged.
                 if _is_geoblock_403(post_exc) and self._activate_tor_fallback():
                     print("  🔁 Re-submitting this order via Tor (CF 403)...")
+                    _s0 = time.perf_counter()
+                    timing["tor_resign_start_ts"] = time.time()
                     signed_order = self.client.create_order(order_args)
+                    timing["tor_resign_end_ts"] = time.time()
+                    sign_ms = (time.perf_counter() - _s0) * 1000.0
+                    _p0 = time.perf_counter()
+                    timing["tor_post_start_ts"] = time.time()
                     result = self.client.post_order(signed_order, clob_order_type, False)
+                    timing["tor_post_end_ts"] = time.time()
+                    post_ms = (time.perf_counter() - _p0) * 1000.0
                 else:
                     raise
 
             order_id = result.get("orderID", "")
+            print(f"  📊 FAK submitted: ${market_price:.3f}/share "
+                  f"→ {int(shares)} shares for ${planned_spend:.2f}")
             if not order_id:
+                self._log_order_latency(
+                    token_id, market_price, shares, "no_order_id",
+                    bal_ms, sign_ms, post_ms, timing=timing,
+                )
                 return OrderResult(
                     success=False, status=REJECTED,
                     error="No orderID", side="BUY", price=market_price,
                     token_id=token_id[:16] + "...",
+                    bal_ms=bal_ms, sign_ms=sign_ms, post_ms=post_ms,
+                    submit_ack_ms=sign_ms + post_ms,
                 )
 
             time.sleep(5)
-            return self._verify_buy_via_balance(
+            verified = self._verify_buy_via_balance(
                 order_id, market_price, float(shares), token_id, balance_before,
             )
+            verified.bal_ms = bal_ms
+            verified.sign_ms = sign_ms
+            verified.post_ms = post_ms
+            verified.submit_ack_ms = sign_ms + post_ms
+            self._log_order_latency(
+                token_id, market_price, shares,
+                "filled" if verified.success else "acked_unverified",
+                bal_ms, sign_ms, post_ms, timing=timing,
+            )
+            return verified
 
         except Exception as e:
             if _is_fak_no_fill_error(e):
+                self._log_order_latency(
+                    token_id, market_price, shares, "no_fill_liquidity_gone",
+                    bal_ms, sign_ms, post_ms, timing=timing,
+                )
                 return OrderResult(
                     success=False,
                     status=REJECTED,
@@ -408,6 +651,8 @@ class Executor:
                     shares=shares,
                     token_id=token_id[:16] + "...",
                     dry_run=False,
+                    bal_ms=bal_ms, sign_ms=sign_ms, post_ms=post_ms,
+                    submit_ack_ms=sign_ms + post_ms,
                 )
 
             time.sleep(3)
@@ -415,19 +660,89 @@ class Executor:
             spent = balance_before - balance_after if balance_before > 0 else 0
 
             if spent > 1.0:
-                actual_shares = spent / market_price if market_price > 0 else 0
+                actual_shares = float(int(shares))
+                planned_notional = round(actual_shares * market_price, 2)
+                estimated_fee = max(0.0, spent - planned_notional)
                 print(f"  👻 GHOST BUY: balance dropped ${spent:.2f} despite error")
+                self._log_order_latency(
+                    token_id, market_price, shares, "ghost_filled",
+                    bal_ms, sign_ms, post_ms, timing=timing,
+                )
                 return OrderResult(
                     success=True, order_id="ghost-buy",
                     status=FILLED, side="BUY", price=market_price,
                     amount_usd=spent, shares=actual_shares,
                     token_id=token_id[:16] + "...", dry_run=False,
+                    planned_order_notional_usd=planned_notional,
+                    actual_cash_spent_usd=spent,
+                    estimated_fee_usd=estimated_fee,
+                    bal_ms=bal_ms, sign_ms=sign_ms, post_ms=post_ms,
+                    submit_ack_ms=sign_ms + post_ms,
                 )
 
+            self._log_order_latency(
+                token_id, market_price, shares, "error",
+                bal_ms, sign_ms, post_ms, timing=timing,
+            )
             return OrderResult(
                 success=False, status=FAILED, error=sanitize_exception_text(e),
                 side="BUY", price=market_price, token_id=token_id[:16] + "...",
+                bal_ms=bal_ms, sign_ms=sign_ms, post_ms=post_ms,
+                submit_ack_ms=sign_ms + post_ms,
             )
+
+    def _log_order_latency(
+        self, token_id: str, price: float, shares: float, outcome: str,
+        bal_ms: float, sign_ms: float, post_ms: float,
+        timing: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Print + persist the submit->ack latency split for post-run analysis.
+
+        post_ms is the network round-trip plus server-side FAK match (one bucket;
+        the match happens inside the POST response, inseparable client-side). The
+        no-fills are lost in this window, so this is the number to drive down.
+        """
+        submit_ack_ms = sign_ms + post_ms
+        print(
+            f"  ⏱  order latency: bal={bal_ms:.0f}ms sign={sign_ms:.0f}ms "
+            f"post(net+match)={post_ms:.0f}ms | submit→ack={submit_ack_ms:.0f}ms "
+            f"[{outcome}]"
+        )
+        try:
+            timing = timing or {}
+            log_dir = os.getenv("LOG_DIR", "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(log_dir, "order_latency.csv")
+            new_file = not os.path.exists(path)
+            fields = [
+                "ts", "token_id", "price", "shares", "outcome",
+                "bal_ms", "sign_ms", "post_ms", "submit_ack_ms",
+                "signal_ready_ts", "final_book_snapshot_ts", "executor_buy_start_ts",
+                "sign_start_ts", "sign_end_ts", "post_start_ts", "post_end_ts",
+                "book_age_ms", "book_hash", "sdk_warmed",
+            ]
+            with open(path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if new_file:
+                    writer.writerow(fields)
+                writer.writerow([
+                    f"{time.time():.3f}", str(token_id), f"{price:.4f}",
+                    f"{float(shares):.0f}", outcome,
+                    f"{bal_ms:.1f}", f"{sign_ms:.1f}", f"{post_ms:.1f}",
+                    f"{submit_ack_ms:.1f}",
+                    _fmt_ts(timing.get("signal_ready_ts")),
+                    _fmt_ts(timing.get("final_book_snapshot_ts")),
+                    _fmt_ts(timing.get("executor_buy_start_ts")),
+                    _fmt_ts(timing.get("sign_start_ts")),
+                    _fmt_ts(timing.get("sign_end_ts")),
+                    _fmt_ts(timing.get("post_start_ts")),
+                    _fmt_ts(timing.get("post_end_ts")),
+                    _fmt_float(timing.get("book_age_ms")),
+                    str(timing.get("book_hash") or ""),
+                    int(bool(timing.get("sdk_warmed"))),
+                ])
+        except Exception as e:
+            print(f"  ⏱  latency log failed: {sanitize_exception_text(e)}")
 
     def _verify_buy_via_balance(
         self, order_id: str, price: float, shares: float,
@@ -439,15 +754,21 @@ class Executor:
             spent = balance_before - balance_after if balance_before > 0 else 0
 
             if spent > 0.50:
-                actual_shares = spent / price if price > 0 else shares
+                actual_shares = float(int(shares))
+                planned_notional = round(actual_shares * price, 2)
+                estimated_fee = max(0.0, spent - planned_notional)
                 suffix = f" (attempt {attempt+1})" if attempt > 0 else ""
                 print(f"  ✓ Balance verified{suffix}: spent ${spent:.2f} "
-                      f"(~{actual_shares:.0f} shares @ ${price:.3f})")
+                      f"({actual_shares:.0f} shares @ ${price:.3f}; "
+                      f"fee≈${estimated_fee:.2f})")
                 return OrderResult(
                     success=True, order_id=order_id, status=FILLED,
                     side="BUY", price=price,
                     amount_usd=spent, shares=actual_shares,
                     token_id=token_id[:16] + "...", dry_run=False,
+                    planned_order_notional_usd=planned_notional,
+                    actual_cash_spent_usd=spent,
+                    estimated_fee_usd=estimated_fee,
                 )
 
             fill = self._check_order(order_id)
@@ -462,6 +783,9 @@ class Executor:
                         side="BUY", price=matched[0],
                         amount_usd=matched[1], shares=matched[2],
                         token_id=token_id[:16] + "...", dry_run=False,
+                        planned_order_notional_usd=round(matched[0] * matched[2], 2),
+                        actual_cash_spent_usd=matched[1],
+                        estimated_fee_usd=max(0.0, matched[1] - round(matched[0] * matched[2], 2)),
                     )
 
             if attempt < 2:
@@ -525,17 +849,16 @@ class Executor:
         balance_before = self.get_collateral_balance()
 
         try:
-            order_args = MarketOrderArgsV2(
+            order_args = OrderArgsV2(
                 token_id=token_id,
-                amount=float(sell_shares),
+                price=self._round_price_to_tick(price),
+                size=float(int(sell_shares)),
                 side="SELL",
-                price=price,
-                order_type=OrderType.GTC,
                 user_usdc_balance=balance_before,
             )
 
-            signed_order = self.client.create_market_order(order_args)
-            result = self.client.post_order(signed_order, OrderType.GTC)
+            signed_order = self.client.create_order(order_args)
+            result = self.client.post_order(signed_order, OrderType.GTC, False)
             order_id = result.get("orderID", "")
 
             time.sleep(2)

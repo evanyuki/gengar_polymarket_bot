@@ -28,10 +28,12 @@ class TradeSignal:
     markov_persistence: float = 0.0
     markov_regime: str = "markov_strong"
     edge_required: float = 0.05
-    markov_size_multiplier: float = 1.0
-    # Delta used by the probability model. In live this is the de-biased Binance
-    # window move (Binance-now vs Binance-window-open) — the same anchor as the
-    # signal, NOT Chainlink-vs-open whose ~14bps basis poisons the direction.
+    payoff_ratio: float = 0.0
+    required_win_rate: float = 0.0
+    # Delta used by the probability model. In live this is the settlement-source
+    # move: RTDS Chainlink current price vs Polymarket/Chainlink official
+    # openPrice. Binance-local delta is retained only as degraded fallback and
+    # diagnostic context.
     model_delta_pct: float = 0.0
 
 
@@ -43,19 +45,15 @@ class StrategyConfig:
     entry_window_end: int = 10
     max_price: float = 0.90
     min_price: float = 0.50
-    min_btc_delta: float = 0.06     # minimum |btc_delta_pct| — below this the oracle and Binance can disagree
     kelly_fraction: float = 0.25    # Quarter-Kelly (conservative)
-    min_bet: float = 5.0            # strategy/order budget floor in dollars; CLOB size min is shares
+    # No dollar MIN_BET: live Polymarket minimum_order_size is a share count,
+    # handled by executor.plan_minimum_lot_order() after the live executable ask.
     max_bet: float = 25.0           # Hard cap per trade
+    # Markov is diagnostics only. It classifies regimes for logging/calibration;
+    # it does not gate entries and has no size multipliers.
     markov_persistence_threshold: float = 0.87
     markov_medium_threshold: float = 0.75
     markov_weak_min_transitions: int = 5
-    markov_medium_edge: float = 0.07
-    markov_weak_edge: float = 0.08
-    markov_insufficient_edge: float = 0.10
-    markov_medium_size_multiplier: float = 0.50
-    markov_weak_size_multiplier: float = 0.35
-    markov_insufficient_size_multiplier: float = 0.25
     high_price_edge_buffer_threshold: float = 0.80
     high_price_min_edge: float = 0.08
     # Momentum-confirmation gate. The Brownian model assumes independent
@@ -67,15 +65,15 @@ class StrategyConfig:
     # direction. Replaces the former price-floor gate (a blunt proxy that also
     # discarded cheap winners: px<0.78 & m15-aligned won 81.5% / +0.609/trade).
     require_momentum_align: bool = False
+    # Binary payoff guard: effective price q is the breakeven required WR;
+    # payoff ratio is (1-q)/q. This attacks the actual loss mode: thin odds.
+    min_payoff_ratio: float = 0.0
+    max_required_win_rate: float = 1.0
 
 
 @dataclass
 class MarkovRiskModifier:
     regime: str
-    allowed: bool
-    edge_required: float
-    size_multiplier: float
-    raw_persistence: float
 
 
 @dataclass
@@ -90,6 +88,7 @@ class HourlyStats:
     windows_skipped: int = 0
     edges: list = field(default_factory=list)
     deltas: list = field(default_factory=list)
+    entry_prices: list = field(default_factory=list)
     trade_profits: list = field(default_factory=list)
 
     @property
@@ -105,6 +104,10 @@ class HourlyStats:
         return sum(abs(d) for d in self.deltas) / len(self.deltas) if self.deltas else 0.0
 
     @property
+    def avg_entry_price(self) -> float:
+        return sum(self.entry_prices) / len(self.entry_prices) if self.entry_prices else 0.0
+
+    @property
     def best_trade(self) -> float:
         return max(self.trade_profits) if self.trade_profits else 0.0
 
@@ -112,10 +115,12 @@ class HourlyStats:
     def worst_trade(self) -> float:
         return min(self.trade_profits) if self.trade_profits else 0.0
 
-    def record_trade(self, edge: float, delta: float):
+    def record_trade(self, edge: float, delta: float, entry_price: float = 0.0):
         self.trades += 1
         self.edges.append(edge)
         self.deltas.append(delta)
+        if entry_price > 0:
+            self.entry_prices.append(entry_price)
 
     def record_result(self, profit: float, won: bool):
         if won:
@@ -140,6 +145,7 @@ class HourlyStats:
         self.windows_skipped = 0
         self.edges.clear()
         self.deltas.clear()
+        self.entry_prices.clear()
         self.trade_profits.clear()
 
     def to_dict(self) -> dict:
@@ -153,6 +159,7 @@ class HourlyStats:
             "windows_skipped": self.windows_skipped,
             "avg_edge": self.avg_edge,
             "avg_delta": self.avg_delta,
+            "avg_entry_price": self.avg_entry_price,
             "best_trade": self.best_trade,
             "worst_trade": self.worst_trade,
         }
@@ -225,6 +232,17 @@ def fee_adjusted_edge(true_prob: float, market_price: float, fee_rate_bps: float
     return true_prob - effective_market_price(market_price, fee_rate_bps)
 
 
+def payoff_ratio(market_price: float, fee_rate_bps: float = 0.0) -> float:
+    effective_price = effective_market_price(market_price, fee_rate_bps)
+    if effective_price <= 0 or effective_price >= 1:
+        return 0.0
+    return (1.0 - effective_price) / effective_price
+
+
+def required_win_rate(market_price: float, fee_rate_bps: float = 0.0) -> float:
+    return min(max(effective_market_price(market_price, fee_rate_bps), 0.0), 1.0)
+
+
 def kelly_fraction(true_prob: float, market_price: float, fee_rate_bps: float = 0.0) -> float:
     """Explicit Kelly criterion: f* = p − (1−p)/b.
 
@@ -244,7 +262,6 @@ def kelly_bet_size(
     market_price: float,
     bankroll: float,
     fraction: float = 0.25,
-    min_bet: float = 1.0,
     max_bet: float = 25.0,
     fee_rate_bps: float = 0.0,
 ) -> float:
@@ -255,7 +272,7 @@ def kelly_bet_size(
         return 0.0
 
     bet = bankroll * kelly_f * fraction
-    return max(min(bet, max_bet), min_bet)
+    return min(bet, max_bet)
 
 
 def estimate_true_probability(
@@ -286,13 +303,11 @@ def markov_risk_modifier(
     market_price: float,
     config: "StrategyConfig",
 ) -> MarkovRiskModifier:
-    """Convert Markov diagnostics into edge and sizing requirements.
+    """Return Markov diagnostics only; do not gate, thicken edge, or haircut size.
 
-    Markov is deliberately not a simple hard gate. The live data showed that
-    many 5-minute oracle-lag opportunities appear before the 60s Markov sample
-    has enough non-flat transitions. Treat insufficient samples as higher risk
-    requiring thicker edge and smaller size; only hard-skip when there is enough
-    evidence and persistence is genuinely low.
+    Live evidence says the real loss mode is payoff/required-WR structure. The
+    Markov buffer stays as a calibration feature so we can later prove/disprove
+    persistence buckets, but it no longer changes entry eligibility or sizing.
     """
     stats = markov_stats or {}
     total = int(stats.get("total") or 0)
@@ -301,40 +316,16 @@ def markov_risk_modifier(
 
     if total >= 8 and raw_persistence >= config.markov_persistence_threshold:
         regime = "markov_strong"
-        allowed = True
-        edge_required = config.min_edge
-        size_multiplier = 1.0
     elif total >= 8 and raw_persistence >= config.markov_medium_threshold:
         regime = "markov_medium"
-        allowed = True
-        edge_required = config.markov_medium_edge
-        size_multiplier = config.markov_medium_size_multiplier
     elif total >= config.markov_weak_min_transitions and raw_persistence >= config.markov_medium_threshold:
         regime = "markov_weak_sample_positive"
-        allowed = True
-        edge_required = config.markov_weak_edge
-        size_multiplier = config.markov_weak_size_multiplier
     elif total < config.markov_weak_min_transitions:
         regime = "markov_insufficient_sample"
-        allowed = True
-        edge_required = config.markov_insufficient_edge
-        size_multiplier = config.markov_insufficient_size_multiplier
     else:
         regime = "markov_low_persistence"
-        allowed = False
-        edge_required = config.markov_weak_edge
-        size_multiplier = 0.0
 
-    if market_price >= config.high_price_edge_buffer_threshold and regime != "markov_strong":
-        edge_required = max(edge_required, config.high_price_min_edge)
-
-    return MarkovRiskModifier(
-        regime=regime,
-        allowed=allowed,
-        edge_required=edge_required,
-        size_multiplier=size_multiplier,
-        raw_persistence=raw_persistence,
-    )
+    return MarkovRiskModifier(regime=regime)
 
 
 def get_skip_reason(
@@ -353,10 +344,11 @@ def get_skip_reason(
 ) -> str:
     """Return why evaluate() returned None, for signal logging.
 
-    Returns one of: "delta_too_small", "prob_below_min", "edge_below_min",
-    "price_out_of_range", or "" (no skip reason — should have traded).
-    "edge_gone_at_market" is set by the caller in bot.py after the live
-    price re-check.
+    Returns one of "" (no skip reason — should have traded),
+    "before_entry_window", "after_entry_window", "model_source_side_disagrees",
+    "momentum_not_aligned", "price_out_of_range", "prob_below_min",
+    "edge_below_min", "required_wr_too_high", "payoff_ratio_too_low",
+    "kelly_below_min", or "edge_below_min_after_fees".
     """
     if config is None:
         config = StrategyConfig()
@@ -371,8 +363,6 @@ def get_skip_reason(
     model_delta_pct = ((model_price - opening_price) / opening_price) * 100
     signal_side = "UP" if btc_delta_pct > 0 else "DOWN"
     model_side = "UP" if model_delta_pct > 0 else "DOWN"
-    if abs(btc_delta_pct) < config.min_btc_delta:
-        return "delta_too_small"
     if model_side != signal_side:
         return "model_source_side_disagrees"
     if config.require_momentum_align and momentum_15s_pct is not None:
@@ -391,25 +381,27 @@ def get_skip_reason(
     if true_prob < config.min_prob:
         return "prob_below_min"
     edge = true_prob - market_price
-    risk = markov_risk_modifier(markov_persistence, markov_stats, market_price, config)
-    if not risk.allowed:
-        return risk.regime
     if edge < config.min_edge:
         return "edge_below_min"
     net_edge = fee_adjusted_edge(true_prob, market_price, fee_rate_bps)
+    req_wr = required_win_rate(market_price, fee_rate_bps)
+    pr = payoff_ratio(market_price, fee_rate_bps)
+    if req_wr > config.max_required_win_rate:
+        return "required_wr_too_high"
+    if pr < config.min_payoff_ratio:
+        return "payoff_ratio_too_low"
     bet_size = kelly_bet_size(
         true_prob=true_prob,
         market_price=market_price,
         bankroll=1.0,
         fraction=config.kelly_fraction,
-        min_bet=config.min_bet,
         max_bet=config.max_bet,
         fee_rate_bps=fee_rate_bps,
     )
     if bet_size <= 0:
         return "kelly_below_min"
-    if net_edge < risk.edge_required:
-        return "markov_edge_buffer_below_required"
+    if net_edge < config.min_edge:
+        return "edge_below_min_after_fees"
     return ""
 
 
@@ -451,9 +443,6 @@ def evaluate(
     model_price = probability_price if probability_price is not None else btc_price
     model_delta_pct = ((model_price - opening_price) / opening_price) * 100
 
-    if abs(btc_delta_pct) < config.min_btc_delta:
-        return None
-
     side = "UP" if btc_delta_pct > 0 else "DOWN"
     model_side = "UP" if model_delta_pct > 0 else "DOWN"
     if model_side != side:
@@ -489,11 +478,15 @@ def evaluate(
         return None
 
     risk = markov_risk_modifier(markov_persistence, markov_stats, market_price, config)
-    if not risk.allowed:
-        return None
 
     net_edge = fee_adjusted_edge(true_prob, market_price, fee_rate_bps)
-    if net_edge < risk.edge_required:
+    req_wr = required_win_rate(market_price, fee_rate_bps)
+    pr = payoff_ratio(market_price, fee_rate_bps)
+    if req_wr > config.max_required_win_rate:
+        return None
+    if pr < config.min_payoff_ratio:
+        return None
+    if net_edge < config.min_edge:
         return None
 
     bet_size = kelly_bet_size(
@@ -501,7 +494,6 @@ def evaluate(
         market_price=market_price,
         bankroll=bankroll,
         fraction=config.kelly_fraction,
-        min_bet=config.min_bet,
         max_bet=config.max_bet,
         fee_rate_bps=fee_rate_bps,
     )
@@ -509,12 +501,13 @@ def evaluate(
     if bet_size <= 0:
         return None
 
-    # Full quarter-Kelly. The markov size-haircut (x0.25-0.50) was an EV leak —
-    # it shrank size based on an undersampled transition buffer that is ~0 for
-    # nearly all 5-min signals, not based on losing signals. Outcome is governed
-    # by the momentum-confirmation gate + source consensus, not markov size.
-    # risk.size_multiplier is still recorded on the signal for diagnostics.
-    bet_size = round(max(config.min_bet, bet_size), 2)
+    # Raw fractional Kelly. Live execution later converts this dollar sanity
+    # budget into a Polymarket minimum-share-lot plan; do not floor it with a
+    # fake dollar MIN_BET because the real CLOB minimum is shares.
+    # Markov regime is still recorded for diagnostics, but all Markov size
+    # multipliers/haircuts were removed. Live sizing stays raw fractional Kelly
+    # before executor-level 5-share lot planning.
+    bet_size = round(bet_size, 2)
 
     confidence = min(gap / 0.10, 1.0)
 
@@ -532,7 +525,8 @@ def evaluate(
         fee_rate_bps=fee_rate_bps,
         markov_persistence=markov_persistence,
         markov_regime=risk.regime,
-        edge_required=risk.edge_required,
-        markov_size_multiplier=risk.size_multiplier,
+        edge_required=config.min_edge,
+        payoff_ratio=pr,
+        required_win_rate=req_wr,
         model_delta_pct=model_delta_pct,
     )

@@ -28,6 +28,7 @@ class CachedBook:
     bids: list[BookLevel] = field(default_factory=list)  # high -> low
     asks: list[BookLevel] = field(default_factory=list)  # low -> high
     timestamp: float = 0.0
+    book_hash: str = ""
 
 
 @dataclass
@@ -41,6 +42,16 @@ class BuyDepthSnapshot:
     required_shares: float = 0.0
     book_age_ms: float = 0.0
     enough: bool = False
+
+
+@dataclass
+class EntryOrderBookSnapshot:
+    executable_buy_price: float = 0.0
+    executable_sell_price: float = 0.0
+    depth: BuyDepthSnapshot = field(default_factory=BuyDepthSnapshot)
+    snapshot_ts: float = 0.0
+    snapshot_age_ms: float = 0.0
+    book_hash: str = ""
 
 
 class ClobOrderBookCache:
@@ -90,12 +101,13 @@ class ClobOrderBookCache:
             except Exception:
                 pass
 
-    def apply_book(self, token_id: str, bids: Iterable[dict], asks: Iterable[dict], timestamp: Optional[float] = None) -> None:
+    def apply_book(self, token_id: str, bids: Iterable[dict], asks: Iterable[dict], timestamp: Optional[float] = None, book_hash: str = "") -> None:
         ts = time.time() if timestamp is None else float(timestamp)
         book = CachedBook(
             bids=sorted(self._parse_levels(bids), key=lambda x: x.price, reverse=True),
             asks=sorted(self._parse_levels(asks), key=lambda x: x.price),
             timestamp=ts,
+            book_hash=str(book_hash or ""),
         )
         with self._lock:
             self._books[str(token_id)] = book
@@ -148,6 +160,39 @@ class ClobOrderBookCache:
         if not book or required_shares <= 0 or cap_price <= 0:
             return BuyDepthSnapshot(required_shares=float(required_shares), cap_price=float(cap_price))
 
+        return self._buy_depth_from_book(book, required_shares, cap_price)
+
+    def get_entry_snapshot(
+        self,
+        token_id: str,
+        buy_usd_amount: float,
+        sell_shares_amount: float,
+        required_buy_shares: float,
+        cap_price: float,
+    ) -> EntryOrderBookSnapshot:
+        """Read one fresh book copy and derive every entry price/depth field from it."""
+        book = self._fresh_book(token_id)
+        if not book:
+            return EntryOrderBookSnapshot(
+                depth=BuyDepthSnapshot(
+                    required_shares=float(required_buy_shares),
+                    cap_price=float(cap_price),
+                )
+            )
+        age_ms = round((time.time() - book.timestamp) * 1000.0, 1)
+        return EntryOrderBookSnapshot(
+            executable_buy_price=self._walk_buy(book.asks, float(buy_usd_amount)),
+            executable_sell_price=self._walk_sell(book.bids, float(sell_shares_amount)),
+            depth=self._buy_depth_from_book(book, required_buy_shares, cap_price),
+            snapshot_ts=book.timestamp,
+            snapshot_age_ms=age_ms,
+            book_hash=book.book_hash,
+        )
+
+    def _buy_depth_from_book(self, book: CachedBook, required_shares: float, cap_price: float) -> BuyDepthSnapshot:
+        if required_shares <= 0 or cap_price <= 0:
+            return BuyDepthSnapshot(required_shares=float(required_shares), cap_price=float(cap_price))
+
         remaining = float(required_shares)
         cumulative_shares = 0.0
         cumulative_usd = 0.0
@@ -181,7 +226,12 @@ class ClobOrderBookCache:
                 return None
             if time.time() - book.timestamp > self.max_book_age_seconds:
                 return None
-            return CachedBook(bids=list(book.bids), asks=list(book.asks), timestamp=book.timestamp)
+            return CachedBook(
+                bids=list(book.bids),
+                asks=list(book.asks),
+                timestamp=book.timestamp,
+                book_hash=book.book_hash,
+            )
 
     def _walk_buy(self, asks: list[BookLevel], usd_amount: float) -> float:
         if usd_amount <= 0:
@@ -258,7 +308,7 @@ class ClobOrderBookCache:
             if event_type == "book" or ("bids" in event and "asks" in event):
                 token_id = token_id or str(event.get("asset_id") or "")
                 if token_id:
-                    self.apply_book(token_id, event.get("bids") or [], event.get("asks") or [], ts)
+                    self.apply_book(token_id, event.get("bids") or [], event.get("asks") or [], ts, str(event.get("hash") or event.get("book_hash") or ""))
             elif event_type == "price_change":
                 changes = event.get("changes") or []
                 by_token: dict[str, list[dict]] = {}

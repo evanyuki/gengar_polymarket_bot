@@ -5,7 +5,6 @@ def test_skip_reason_reports_before_entry_window_before_price_range():
     cfg = StrategyConfig(
         entry_window_start=240,
         entry_window_end=10,
-        min_btc_delta=0.0,
         min_price=0.50,
         max_price=0.90,
         markov_persistence_threshold=0.0,
@@ -28,7 +27,6 @@ def test_skip_reason_reports_after_entry_window_before_price_range():
     cfg = StrategyConfig(
         entry_window_start=240,
         entry_window_end=10,
-        min_btc_delta=0.0,
         min_price=0.50,
         max_price=0.90,
         markov_persistence_threshold=0.0,

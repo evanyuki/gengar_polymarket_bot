@@ -9,7 +9,6 @@ def test_tracker_logs_gate_level_tick_diagnostics(tmp_path):
     decision = SourceConsensusDecision(
         action="pass",
         reason="source_consensus_ok",
-        size_multiplier=1.0,
         signal_price=101.0,
         signal_side="UP",
         chainlink_price=100.9,

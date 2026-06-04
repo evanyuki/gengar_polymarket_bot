@@ -34,10 +34,8 @@ def test_evaluate_rejects_signal_when_fee_adjusted_kelly_is_zero():
     cfg = StrategyConfig(
         min_edge=0.05,
         min_prob=0.0,
-        min_btc_delta=0.0,
         min_price=0.01,
         max_price=0.99,
-        min_bet=5.0,
         max_bet=5.0,
         markov_persistence_threshold=0.0,
     )
@@ -62,10 +60,8 @@ def test_skip_reason_reports_fee_adjusted_kelly_below_min_before_buy_attempt():
     cfg = StrategyConfig(
         min_edge=0.05,
         min_prob=0.0,
-        min_btc_delta=0.0,
         min_price=0.01,
         max_price=0.99,
-        min_bet=5.0,
         max_bet=5.0,
         markov_persistence_threshold=0.0,
     )

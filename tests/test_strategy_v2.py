@@ -13,10 +13,8 @@ def _momentum_config():
     return StrategyConfig(
         min_edge=0.05,
         min_prob=0.0,
-        min_btc_delta=0.0,
         min_price=0.01,
         max_price=0.99,
-        min_bet=1.0,
         max_bet=100.0,
         require_momentum_align=True,
     )
@@ -91,10 +89,8 @@ def test_entry_uses_model_probability_minus_market_price_gap():
     cfg = StrategyConfig(
         min_edge=0.05,
         min_prob=0.0,
-        min_btc_delta=0.0,
         min_price=0.01,
         max_price=0.99,
-        min_bet=1.0,
         max_bet=100.0,
     )
 
@@ -123,10 +119,8 @@ def test_entry_probability_uses_chainlink_price_when_probability_price_is_suppli
     cfg = StrategyConfig(
         min_edge=0.0,
         min_prob=0.0,
-        min_btc_delta=0.0,
         min_price=0.01,
         max_price=0.99,
-        min_bet=0.0,
         max_bet=100.0,
     )
 
@@ -156,7 +150,6 @@ def test_entry_rejects_when_chainlink_probability_side_disagrees_with_binance_si
     cfg = StrategyConfig(
         min_edge=0.0,
         min_prob=0.0,
-        min_btc_delta=0.0,
         min_price=0.01,
         max_price=0.99,
     )
@@ -183,7 +176,6 @@ def test_entry_rejects_when_gap_below_epsilon_even_if_probability_high():
     cfg = StrategyConfig(
         min_edge=0.05,
         min_prob=0.0,
-        min_btc_delta=0.0,
         min_price=0.01,
         max_price=0.99,
     )
@@ -203,11 +195,10 @@ def test_entry_rejects_when_gap_below_epsilon_even_if_probability_high():
     assert signal is None
 
 
-def test_markov_low_persistence_blocks_only_when_sample_is_sufficient():
+def test_markov_low_persistence_is_logged_not_used_as_entry_gate():
     cfg = StrategyConfig(
         min_edge=0.05,
         min_prob=0.0,
-        min_btc_delta=0.0,
         min_price=0.01,
         max_price=0.99,
         markov_persistence_threshold=0.87,
@@ -226,7 +217,9 @@ def test_markov_low_persistence_blocks_only_when_sample_is_sufficient():
         markov_stats={"same": 5, "total": 8, "directional_samples": 10, "flat_samples": 500},
     )
 
-    assert signal is None
+    assert signal is not None
+    assert signal.markov_regime == "markov_low_persistence"
+    assert signal.edge_required == cfg.min_edge
 
 
 def test_kelly_fraction_uses_explicit_formula_p_minus_one_minus_p_over_b():
@@ -242,10 +235,8 @@ def test_fee_aware_kelly_reduces_position_size():
     cfg = StrategyConfig(
         min_edge=0.05,
         min_prob=0.0,
-        min_btc_delta=0.0,
         min_price=0.01,
         max_price=0.99,
-        min_bet=0.0,
         max_bet=100.0,
     )
 
