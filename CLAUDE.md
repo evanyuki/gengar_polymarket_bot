@@ -8,7 +8,7 @@ An algorithmic trading bot ("PolyBot") for Polymarket's 5-minute BTC Up/Down bin
 
 JLow (jlowplayground on Polymarket). Solo developer. Started from zero software development knowledge in January 2026, built this from scratch using Claude + Cursor. Treats this as a serious trading operation.
 
-## Current version: v14 — Momentum-confirmed FAK taker + Hold-to-resolution
+## Current version: v15 — Chainlink-anchored entry + 50% price stop
 
 ### Files
 
@@ -44,7 +44,7 @@ proxy.py            → Tor proxy for CLOB API geo-restrictions
 
 Every 5 minutes, Polymarket opens a market: "Will BTC be higher or lower?" Shares pay $1 (correct) or $0 (wrong). BTC moves on Binance instantly, but Polymarket's order book reprices with a lag. The bot buys the correct side during that lag.
 
-### Entry pipeline (four filters)
+### Entry pipeline (five filters)
 
 1. **Brownian motion model** (`estimate_true_probability` in strategy.py)
    - Input: `btc_delta_pct` (BTC move from window open) + `seconds_remaining`
@@ -59,15 +59,17 @@ Every 5 minutes, Polymarket opens a market: "Will BTC be higher or lower?" Share
 
 4. **Momentum-confirmation gate**: live `ENTRY_REQUIRE_MOMENTUM_ALIGN=true` — `momentum_15s_pct` must be the same sign as the signal side (move still pushing, not fading/flat). Anti-mean-reversion. Official-settlement backtest (90 windows): m15-aligned won 88.5% (+0.570/trade) vs m15-fading 72.7% (-0.359/trade). Replaced the removed `ENTRY_PRICE_FLOOR=0.78` gate, which discarded cheap m15-aligned winners (px<0.78 & aligned won 81.5% / +0.609/trade).
 
+5. **Near-zero Chainlink gate**: `CHAINLINK_MIN_DELTA_PCT=0.07` by default. Direction/probability are anchored to Polymarket `/api/crypto/crypto-price` openPrice + current RTDS Chainlink, not Binance local boundary. Full available signal-ready Chainlink-observable backtest: 43 entries baseline 38W/5L, +$22.05 sim PnL; threshold 0.07 kept 41 entries, 37W/4L, +$25.61; the 0.06-0.07 band was 1W/1L, -$3.57. Raising above 0.07 over-pruned profitable trades.
+
 ### Position sizing and execution
 
-Quarter-Kelly criterion. `kelly_f = (b*p - q) / b` where `b = (1-price)/price`. Then `bet = bankroll × kelly_f × 0.25`. Bounded by configured `MIN_BET`/`MAX_BET`. CLOB `minimum_order_size` is shares (BTC 5m commonly 5 shares), not a fixed $5 notional; for FAK BUY market orders the bot ensures the dollar amount can buy at least `mos` shares at the worst-price cap.
+Quarter-Kelly criterion computes raw dollar Kelly only: `kelly_f = (b*p - q) / b`, `bet = bankroll × kelly_f × fraction`, capped by `MAX_BET`. There is no live `MIN_BET` dollar floor. CLOB `minimum_order_size` is shares (BTC 5m commonly 5 shares), not a fixed $5 notional. Live sizing is explicit minimum-share-lot sizing: compute 5-share cost at the FAK cap, skip if it exceeds `MAX_BET` or `ENTRY_MIN_SIZE_KELLY_RATIO × raw_kelly`, otherwise buy whole shares using the larger of raw Kelly and the minimum share cost.
 
-Execution policy is intentionally narrow: FAK taker only. A signal that clears the four entry filters fires immediately at a worst-price cap (`ENTRY_FAK_SLIPPAGE_TICKS` above the live ask); the live ask is re-validated against `edge_required` first. GTD/post-only maker entry was removed because it conflicts with the oracle-lag thesis: if the edge is real, immediate execution is worth more than maker fee savings.
+Execution policy is intentionally narrow: FAK taker only. A signal that clears the entry filters fires immediately at the current executable ask cap (no +tick chase); the live ask is re-validated against `edge_required` first. GTD/post-only maker entry was removed because it conflicts with the oracle-lag thesis: if the edge is real, immediate execution is worth more than maker fee savings.
 
-### Exit: hold to resolution
+### Exit: 50% price stop + resolution fallback
 
-Default and intended policy is hold-to-resolution. This is hardcoded — there is NO env toggle (`STOP_LOSS_ENABLED` is not read by any code; do not document it as live config). Stop-loss/prob-stop code is not used in the live position manager. Sell prices and held-side Brownian probability are monitored for diagnostics/calibration only. Older analysis showed stops can destroy value in this market because BTC micro-bounces can trigger exits that later resolve correctly.
+Default policy is now `STOP_LOSS_ENABLED=true` with `STOP_LOSS_PRICE_FRACTION=0.50`: if the current sell price for the held side falls to ≤50% of entry price, the bot sells the position if it is sellable. This is a risk cap, not proven EV improvement. Full available completed-trade replay showed hold-to-resolution +$15.69 over 42 trades; an optimistic 50% stop would have been +$10.09 if all stops were executable, or +$10.82 with a 5-share sellability constraint. The reason to ship it anyway: it prevents a wrong-way position from riding a collapsed sell price to $0 when the CLOB can actually exit. If the held size is below Polymarket's sell minimum, the bot logs the stop hit and holds to resolution.
 
 For LIVE resolution, Binance is not final truth. Reconcile using Polymarket claim/order result, official outcome/CSV, and collateral balance. Binance final price is logged only as diagnostic context or dry-run simulation fallback.
 
@@ -119,11 +121,11 @@ Polymarket has TWO order books per token:
 - **Raw token book**: illiquid, $0.06/$0.94 spread, almost no volume.
 - **Complement engine book**: tight 1¢ spreads, all real volume. This is where market makers and the UI trade.
 
-Current v14 entry uses `create_market_order(MarketOrderArgsV2)` + `post_order(..., OrderType.FAK, post_only=False)` for taker buys only. Official docs: BUY market orders specify dollar amount; FAK executes immediately against resting liquidity and cancels the remainder. Always pass a worst-price cap and verify by balance/order status.
+Current entry uses `create_order(OrderArgsV2)` with explicit integer shares + `post_order(..., OrderType.FAK, post_only=False)` for taker buys only. The BUY `MarketOrderArgsV2(amount=USD)` / `create_market_order` path is intentionally deleted because amount/price float division can produce invalid share precision. Always pass a worst-price cap and verify by balance/order status.
 
 ### Float precision warning
 
-Older versions avoided BUY market orders because some py-clob-client paths divided `amount/price` and produced share precision artifacts such as `21.000000000004`, rejected as `"invalid amounts, max accuracy of 4 decimals"`. v14 deliberately accepts the market-order path only for FAK execution; if this error reappears in live logs, do not silently fall back to GTD/post-only. Either fix the SDK/order builder path or skip the trade.
+Older versions avoided BUY market orders because some py-clob-client paths divided `amount/price` and produced share precision artifacts such as `21.000000000004`, rejected as `"invalid amounts, max accuracy of 4 decimals"`. Current code avoids that path entirely for BUY: it creates explicit integer-share `OrderArgsV2` orders. If this error reappears in live logs, do not reintroduce `MarketOrderArgsV2` BUY; fix the SDK/order builder path or skip the trade.
 
 ### Gamma API parsing
 
@@ -176,7 +178,7 @@ The 0.15 value was also tested — too conservative, zero trades in 2.5 hours. 0
 | Partial fill trap | Sell below $5 minimum → error → shares stranded | Minimum notional guard | v11 |
 | P&L tracking drift | Tracked -$6.46, real loss -$15.30 | Window-boundary balance sync | v11 |
 | Decimal precision | `invalid amounts, max accuracy 4 decimals` | Integer shares via `create_order` | v10, re-applied v13 |
-| Prob-stop destroying value | 4/5 stopped trades won at resolution | All stops removed | v12 |
+| Prob-stop destroying value | 4/5 stopped trades won at resolution | Removed probability stops; later reintroduced only a blunt 50% price-stop risk cap | v12/v15 |
 | Model overconfidence | 60% WR despite "80% confident" signals | Vol recalibrated 0.08→0.12 | v13 |
 | Safety factor too tight | Zero trades in 2.5 hours | Raised 0.70→0.85 | v13 |
 | `take_profit_pct` crash | `'PolyBot' object has no attribute` | Removed all stop/TP references | v13 |
@@ -199,7 +201,6 @@ MIN_PROB=0.86
 ENTRY_WINDOW_START=210
 ENTRY_WINDOW_END=10
 KELLY_FRACTION=0.25
-MIN_BET=1.0
 MAX_BET=5.0
 BANKROLL=20.0
 MARKOV_INSUFFICIENT_EDGE=0.10
@@ -216,6 +217,8 @@ VOL_FLOOR=0.12
 
 # Safety
 DAILY_LOSS_LIMIT=10
+STOP_LOSS_ENABLED=true
+STOP_LOSS_PRICE_FRACTION=0.50
 
 # Cold-start gating (block trading until buffers hold real measurements)
 ENTRY_REQUIRE_WARM=true
@@ -223,18 +226,13 @@ SEED_VOL_FROM_KLINES=true
 WARM_MIN_SAMPLES=12
 WARM_MIN_SPAN_S=30
 
-# Source consensus (settlement = Chainlink; Binance is signal only)
+# Source consensus (settlement = Chainlink; Binance/RTDS Binance are diagnostic only)
 SOURCE_CONSENSUS_ENABLED=true
 SOURCE_REQUIRE_CHAINLINK=true
-SOURCE_REQUIRE_RTDS_BINANCE=true
-SOURCE_STALE_DOWNSIZE_SEC=10.0
 SOURCE_STALE_SKIP_SEC=30.0
-SOURCE_DOWNSIZE_FACTOR=0.50
-SOURCE_RTDS_SOURCE_GAP_BPS=25.0
-SOURCE_DIRECT_VS_RTDS_BINANCE_GAP_BPS=6.0
+CHAINLINK_MIN_DELTA_PCT=0.07
 
 # Entry execution
-ENTRY_FAK_SLIPPAGE_TICKS=5
 ENTRY_MAX_SPREAD=0.08
 ENTRY_MIN_EXIT_PRICE=0.50
 CLOB_ORDERBOOK_CACHE_ENABLED=true
@@ -249,7 +247,7 @@ MARKET_PERIOD=5
 LOG_DIR=logs
 ```
 
-> Exit policy is hardcoded hold-to-resolution. There is NO `STOP_LOSS_ENABLED` env var (it was documented but never read by code).
+> Exit policy is no longer hardcoded hold-to-resolution. `STOP_LOSS_ENABLED` and `STOP_LOSS_PRICE_FRACTION` are live config.
 > `ENTRY_HUGE_EDGE_MIN` and `ENTRY_PRICE_FLOOR` were removed from code+config on 2026-06-02 — do not re-add as live config.
 
 ---

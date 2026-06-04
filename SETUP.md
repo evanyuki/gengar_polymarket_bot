@@ -154,12 +154,11 @@ DRY_RUN=true   # set to false when ready to trade real money
 # ── Strategy parameters ──────────────────────────────────────────────
 MIN_EDGE=0.05
 MIN_PROB=0.80
-SAFETY_FACTOR=0.85
 ENTRY_WINDOW_START=240
 ENTRY_WINDOW_END=10
 KELLY_FRACTION=0.25
-MIN_BET=5.0
 MAX_BET=25.0
+ENTRY_MIN_SIZE_KELLY_RATIO=3.0
 BANKROLL=100.0   # set this to your actual collateral balance on Polymarket
 
 # ── Safety ───────────────────────────────────────────────────────────
@@ -179,10 +178,10 @@ LOG_DIR=logs
 | Parameter | What it does | Default | Notes |
 |-----------|-------------|---------|-------|
 | `MIN_PROB` | Model must be this confident to trade | 0.80 | Don't lower below 0.75 |
-| `SAFETY_FACTOR` | Market price must be ≤ true_prob × this | 0.85 | Filters fully-priced moves |
-| `KELLY_FRACTION` | Fraction of Kelly criterion to bet | 0.25 | Quarter-Kelly = conservative |
-| `MIN_BET` | Minimum bet size in USD | 5.0 | Polymarket min order is $5 |
+| `KELLY_FRACTION` | Fraction of Kelly criterion used as raw sanity budget | 0.25 | Not a live dollar floor |
 | `MAX_BET` | Maximum bet size in USD | 25.0 | Hard cap regardless of Kelly |
+| `ENTRY_MIN_SIZE_KELLY_RATIO` | Max allowed 5-share floor / raw Kelly ratio | 3.0 | Skip if the exchange share minimum over-bets Kelly |
+| `CHAINLINK_MIN_DELTA_PCT` | Settlement-source near-zero gate | 0.07 | Only Chainlink/openPrice proximity gate |
 | `BANKROLL` | Current trading capital | 100.0 | Update to your real balance |
 | `DAILY_LOSS_LIMIT` | Stop trading after losing this much in a session | 30 | Circuit breaker |
 | `ENTRY_WINDOW_START` | Seconds before window close to start looking for entries | 240 | 4 minutes into a 5-min window |
@@ -300,7 +299,7 @@ This is the float precision bug. Make sure you're on the latest `bot.py` — the
 ### Orders not filling / always getting rejected
 - The CLOB API may be blocking your Tor exit node — restart the bot to get a new circuit
 - Check `https://status.polymarket.com` for outages
-- Verify your collateral balance is sufficient (minimum $5 per order)
+- Verify your collateral balance is sufficient for the market's minimum share lot (BTC 5m commonly 5 shares, so cost is roughly `5 × entry price`)
 
 ### No trades firing in dry-run
 This is normal if BTC isn't moving significantly. The model requires an 80% probability signal, which only fires on genuine moves (0.10%+ within a 5-minute window). You may watch several empty windows before seeing a signal.
